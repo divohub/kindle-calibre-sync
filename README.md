@@ -4,6 +4,28 @@ Automatic bridge for syncing Kindle highlights and notes directly into Calibre a
 
 ![Kindle Calibre Sync Demo](assets/demo.png)
 
+## Quick Start
+
+1. **Install the Obsidian plugin**:
+   - Open Obsidian **Settings** → **Community plugins** → **Browse**, search for **Kindle Calibre Sync**, install, and enable it.
+   - *(While community directory review is pending, you can also install via [BRAT](https://github.com/TfTHacker/obsidian42-brat) by adding `divohub/kindle-calibre-sync`.)*
+2. **Prepare Calibre & Python backend**:
+   - Make sure **Calibre** (with your books added) and **Python 3.9+** are installed.
+   - Clone this repository for the Python sync script and install dependencies:
+     ```bash
+     git clone https://github.com/divohub/kindle-calibre-sync.git
+     cd kindle-calibre-sync
+     pip install -r requirements.txt
+     ```
+3. **Configure paths**:
+   - Set your vault and Calibre paths in `config.json`.
+   - Open **Settings → Kindle Calibre Sync** in Obsidian and verify **Sync script path** (path to `kindle_sync.py`) and **Calibre library path**.
+4. **Sync & Read**:
+   - Plug in your Kindle via USB and click the book icon in the left ribbon (or run the command **Sync highlights with Calibre**).
+   - Click any `[location](calibre://...)` link in your generated book notes to open the EPUB side-by-side at the exact quote.
+
+---
+
 ## Features
 
 1. **Auto-detect Kindle via USB**:
@@ -25,7 +47,7 @@ Automatic bridge for syncing Kindle highlights and notes directly into Calibre a
 
 ---
 
-## Installation
+## System Requirements
 
 1. Ensure Python 3.9+ and Calibre are installed:
 ```bash
@@ -33,7 +55,7 @@ sudo pacman -S python calibre   # Arch Linux
 # or: sudo apt install python3 calibre  # Ubuntu/Debian
 ```
 
-2. Install dependencies (`lxml` for EPUB CFI parsing):
+2. Install Python dependencies (`lxml` for EPUB CFI parsing):
 ```bash
 pip install -r requirements.txt
 ```
