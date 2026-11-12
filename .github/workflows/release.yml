@@ -1,0 +1,54 @@
+name: Release Obsidian plugin
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Use Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22.x"
+          cache: "npm"
+          cache-dependency-path: "obsidian-plugin/package-lock.json"
+
+      - name: Build plugin
+        working-directory: obsidian-plugin
+        run: |
+          npm ci
+          npm run check
+          npm run build
+
+      - name: Prepare release assets
+        run: |
+          cp obsidian-plugin/main.js ./main.js
+          cp obsidian-plugin/styles.css ./styles.css
+
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+
+          gh release create "$tag" \
+            --title="$tag" \
+            --notes="Release $tag" \
+            main.js manifest.json styles.css

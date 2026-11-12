@@ -9,7 +9,7 @@ import {
     OpenViewState,
     MarkdownView
 } from "obsidian";
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
 import { KindleEpubView, VIEW_TYPE_KINDLE_EPUB } from "./view";
@@ -64,7 +64,7 @@ export default class KindleCalibrePlugin extends Plugin {
         // 4. Intercept Obsidian's 'open-url' event (fired right before OS external browser/viewer is launched)
         this.registerDomEvent(
             window as any,
-            "open-url",
+            "open-url" as any,
             (evt: CustomEvent) => {
                 const url = evt.detail?.url;
                 if (typeof url === "string" && (url.startsWith("calibre://view-book/") || url.startsWith("kindle-read://"))) {
@@ -261,7 +261,6 @@ export default class KindleCalibrePlugin extends Plugin {
                                 const dstEpub = path.join(bkDir, path.basename(convertible, path.extname(convertible)) + ".epub");
                                 new Notice("EPUB format missing. Converting book automatically...");
                                 try {
-                                    const { execFileSync } = require("child_process");
                                     execFileSync("ebook-convert", [srcFile, dstEpub]);
                                     if (fs.existsSync(dstEpub)) return dstEpub;
                                 } catch (convErr) {

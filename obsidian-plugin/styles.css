@@ -81,35 +81,35 @@
     overflow: hidden;
 }
 
-.kindle-viewer-container iframe {
-    border: none !important;
+.kindle-reader-wrapper .kindle-viewer-container iframe {
+    border: none;
 }
 
 /* Highlight styling in reader (SVG overlay) */
-.kindle-viewer-container svg {
-    pointer-events: none !important;
+.kindle-reader-wrapper .kindle-viewer-container svg {
+    pointer-events: none;
 }
 
 /* Normal highlights in book (subtle pastel yellow tint, no frame) */
-.kindle-viewer-container svg g.kindle-highlight rect,
-.kindle-viewer-container svg g[ref="kindle-highlight"] rect {
-    fill: #ffd600 !important;
-    fill-opacity: 0.22 !important;
-    stroke: none !important;
-    stroke-width: 0 !important;
-    mix-blend-mode: normal !important;
-    rx: 2px !important;
-    ry: 2px !important;
+.kindle-reader-wrapper .kindle-viewer-container svg g.kindle-highlight rect,
+.kindle-reader-wrapper .kindle-viewer-container svg g[ref="kindle-highlight"] rect {
+    fill: #ffd600;
+    fill-opacity: 0.22;
+    stroke: none;
+    stroke-width: 0;
+    mix-blend-mode: normal;
+    rx: 2px;
+    ry: 2px;
 }
 
 /* Active highlight (soft warm orange marker, no frame, no borders) */
-.kindle-viewer-container svg g.kindle-active-highlight rect,
-.kindle-viewer-container svg g[ref="kindle-active-highlight"] rect {
-    fill: #ff9800 !important;
-    fill-opacity: 0.32 !important;
-    stroke: none !important;
-    stroke-width: 0 !important;
-    mix-blend-mode: normal !important;
-    rx: 2px !important;
-    ry: 2px !important;
+.kindle-reader-wrapper .kindle-viewer-container svg g.kindle-active-highlight rect,
+.kindle-reader-wrapper .kindle-viewer-container svg g[ref="kindle-active-highlight"] rect {
+    fill: #ff9800;
+    fill-opacity: 0.35;
+    stroke: none;
+    stroke-width: 0;
+    mix-blend-mode: normal;
+    rx: 2px;
+    ry: 2px;
 }
