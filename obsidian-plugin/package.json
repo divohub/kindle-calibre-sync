@@ -1,0 +1,14 @@
+{
+  "name": "kindle-calibre-sync-obsidian",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "bun build src/main.ts --outfile main.js --format cjs --target node --external obsidian && cp main.js manifest.json styles.css /home/divo/Documents/obsidiane-private/.obsidian/plugins/kindle-calibre-sync/"
+  },
+  "dependencies": {
+    "epubjs": "^0.3.93"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "obsidian": "^1.14.4"
+  }
+}

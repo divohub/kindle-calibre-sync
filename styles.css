@@ -1,0 +1,115 @@
+/* Kindle Calibre Reader Styles */
+
+.kindle-reader-wrapper {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+    background-color: var(--background-primary);
+}
+
+.kindle-reader-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 12px;
+    background-color: var(--background-secondary);
+    border-bottom: 1px solid var(--divider-color);
+    flex-shrink: 0;
+    gap: 8px;
+}
+
+.kindle-toolbar-left {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    overflow: hidden;
+}
+
+.kindle-reader-title {
+    font-weight: 600;
+    font-size: 0.95em;
+    color: var(--text-normal);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 250px;
+}
+
+.kindle-reader-loc {
+    font-size: 0.8em;
+    color: var(--text-muted);
+}
+
+.kindle-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.kindle-btn {
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-s);
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 4px 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85em;
+    line-height: 1;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.kindle-btn:hover {
+    background-color: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+
+.kindle-btn svg {
+    width: 16px;
+    height: 16px;
+}
+
+.kindle-viewer-container {
+    flex: 1;
+    position: relative;
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+}
+
+.kindle-viewer-container iframe {
+    border: none !important;
+}
+
+/* Highlight styling in reader (SVG overlay) */
+.kindle-viewer-container svg {
+    pointer-events: none !important;
+}
+
+/* Normal highlights in book (subtle pastel yellow tint, no frame) */
+.kindle-viewer-container svg g.kindle-highlight rect,
+.kindle-viewer-container svg g[ref="kindle-highlight"] rect {
+    fill: #ffd600 !important;
+    fill-opacity: 0.22 !important;
+    stroke: none !important;
+    stroke-width: 0 !important;
+    mix-blend-mode: normal !important;
+    rx: 2px !important;
+    ry: 2px !important;
+}
+
+/* Active highlight (soft warm orange marker, no frame, no borders) */
+.kindle-viewer-container svg g.kindle-active-highlight rect,
+.kindle-viewer-container svg g[ref="kindle-active-highlight"] rect {
+    fill: #ff9800 !important;
+    fill-opacity: 0.32 !important;
+    stroke: none !important;
+    stroke-width: 0 !important;
+    mix-blend-mode: normal !important;
+    rx: 2px !important;
+    ry: 2px !important;
+}

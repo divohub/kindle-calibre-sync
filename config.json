@@ -1,0 +1,14 @@
+{
+  "vault_path": "/home/divo/Documents/obsidiane-private",
+  "highlights_folder": "30 - Source Material",
+  "calibre_library_path": "/home/divo/Calibre Library",
+  "calibre_library_id": "Calibre_Library",
+  "kindle_mount_patterns": [
+    "/run/media/*/*",
+    "/media/*/*",
+    "/Volumes/*"
+  ],
+  "clippings_file_relpath": "documents/My Clippings.txt",
+  "clippings_fallback_path": "/home/divo/My Clippings.txt",
+  "inject_calibre_annotations": true
+}

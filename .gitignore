@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+node_modules/
+obsidian-plugin/node_modules/
+obsidian-plugin/main.js
+main.js
+books_index.json
+.DS_Store
