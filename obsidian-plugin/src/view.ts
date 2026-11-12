@@ -6,16 +6,110 @@ import { spawn } from "child_process";
 
 export const VIEW_TYPE_KINDLE_EPUB = "kindle-epub-reader-view";
 
+interface HighlightEntry {
+    range_cfi?: string;
+    point_cfi?: string;
+    start_cfi?: string;
+    spine_index?: number;
+    text?: string;
+}
+
+interface BooksIndexRecord {
+    highlights?: HighlightEntry[];
+}
+
+interface EpubQueue {
+    dequeue: () => unknown;
+    _patchedSafety?: boolean;
+    running?: boolean;
+    run: () => void;
+}
+
+interface ResolvablePromise {
+    resolve: () => void;
+}
+
+interface CfiTerminal {
+    offset?: number;
+}
+
+interface CfiSegment {
+    steps: unknown[];
+    terminal: CfiTerminal;
+}
+
+interface EpubCfiInstance {
+    range?: boolean;
+    path: CfiSegment;
+    start: CfiSegment;
+    end: CfiSegment;
+    findNode: (steps: unknown[], doc: Document, ignoreClass: string | null) => Node | null;
+    toString: () => string;
+    toRange: (doc: Document, ignoreClass?: string) => Range | null;
+    _patchedToRange?: boolean;
+}
+
+interface RenditionAnnotationsInternal {
+    inject: (view: EpubViewInstance) => void;
+    _patchedInject?: boolean;
+}
+
+interface EpubViewsCollection {
+    all?: () => EpubViewInstance[];
+    _views?: EpubViewInstance[];
+}
+
+interface ContentsLike {
+    range: (cfi: string) => Range | null;
+    addStylesheetCss: (css: string, key: string) => void;
+}
+
+interface EpubViewInstance {
+    index: number;
+    contents?: ContentsLike;
+    document?: Document;
+    highlights?: Record<string, unknown>;
+    pane?: { render: () => void };
+    expand?: () => void;
+    unhighlight: (cfi: string) => void;
+    highlight: (
+        cfiRange: string,
+        data: Record<string, string>,
+        cb: () => void,
+        className: string,
+        styles: Record<string, string>
+    ) => void;
+}
+
+interface RenditionInternal {
+    q?: EpubQueue;
+    displaying?: ResolvablePromise;
+    epubcfi?: { constructor?: { prototype?: EpubCfiInstance } };
+    annotations?: RenditionAnnotationsInternal;
+    views?: () => EpubViewInstance[] | EpubViewsCollection;
+    on: (event: string, listener: (...args: unknown[]) => void) => void;
+}
+
+interface LocationPayload {
+    start?: {
+        displayed?: {
+            page?: number;
+            total?: number;
+        };
+        percentage?: number;
+    };
+}
+
 export class KindleEpubView extends ItemView {
     private book: Book | null = null;
     private rendition: Rendition | null = null;
     private currentEpubPath: string = "";
     private currentTitle: string = "E-Book Reader";
     private lastOpenAtCfi: string = "";
-    private currentHighlights: any[] = [];
+    private currentHighlights: HighlightEntry[] = [];
     private currentBookId: string = "";
     private scriptPath: string = "";
-    private previousActiveHighlight: any = null;
+    private previousActiveHighlight: HighlightEntry | null = null;
 
     private headerEl!: HTMLElement;
     private titleSpan!: HTMLElement;
@@ -58,11 +152,15 @@ export class KindleEpubView extends ItemView {
 
         const prevBtn = rightBox.createEl("button", { cls: "kindle-btn", title: "Previous page" });
         setIcon(prevBtn, "chevron-left");
-        prevBtn.onclick = () => this.rendition?.prev();
+        prevBtn.onclick = () => {
+            void this.rendition?.prev();
+        };
 
         const nextBtn = rightBox.createEl("button", { cls: "kindle-btn", title: "Next page" });
         setIcon(nextBtn, "chevron-right");
-        nextBtn.onclick = () => this.rendition?.next();
+        nextBtn.onclick = () => {
+            void this.rendition?.next();
+        };
 
         const fontDown = rightBox.createEl("button", { cls: "kindle-btn", title: "Decrease font size", text: "A-" });
         fontDown.onclick = () => this.changeFontSize(-10);
@@ -91,8 +189,8 @@ export class KindleEpubView extends ItemView {
         // Keyboard arrows
         this.registerDomEvent(window, "keydown", (e: KeyboardEvent) => {
             if (this.containerEl.contains(document.activeElement)) {
-                if (e.key === "ArrowLeft") this.rendition?.prev();
-                if (e.key === "ArrowRight") this.rendition?.next();
+                if (e.key === "ArrowLeft") void this.rendition?.prev();
+                if (e.key === "ArrowRight") void this.rendition?.next();
             }
         });
     }
@@ -101,20 +199,21 @@ export class KindleEpubView extends ItemView {
         this.destroyCurrentBook();
     }
 
-    private patchRenditionSafety() {
+    private patchRenditionSafety(): void {
         if (!this.rendition) return;
+        const renditionInternal = this.rendition as unknown as RenditionInternal;
 
         // 1. Prevent Queue.run() from ever deadlocking if a task rejects or throws
-        const q = (this.rendition as any).q;
+        const q = renditionInternal.q;
         if (q && typeof q.dequeue === "function" && !q._patchedSafety) {
             const origDequeue = q.dequeue.bind(q);
-            q.dequeue = function () {
+            q.dequeue = function (): Promise<unknown> {
                 try {
                     const p = origDequeue();
-                    if (p && typeof p.then === "function") {
-                        return p.then(
-                            (val: any) => val,
-                            (err: any) => {
+                    if (p && typeof (p as PromiseLike<unknown>).then === "function") {
+                        return (p as Promise<unknown>).then(
+                            (val: unknown) => val,
+                            (err: unknown) => {
                                 console.warn("ePub.js queue task error caught:", err);
                                 return undefined;
                             }
@@ -130,28 +229,32 @@ export class KindleEpubView extends ItemView {
         }
 
         // 2. Ensure displayerror never leaves this.rendition.displaying unresolved
-        this.rendition.on("displayerror", (err: any) => {
+        renditionInternal.on("displayerror", (err: unknown) => {
             console.warn("Rendition displayerror:", err);
-            const displaying = (this.rendition as any)?.displaying;
+            const displaying = renditionInternal.displaying;
             if (displaying && typeof displaying.resolve === "function") {
-                try { displaying.resolve(); } catch (e) {}
+                try {
+                    displaying.resolve();
+                } catch {
+                    /* ignore promise resolution error */
+                }
             }
         });
 
         // 3. Patch EpubCFI.prototype.toRange to clamp offsets and never throw IndexSizeError
-        const cfiProto = (this.rendition as any).epubcfi?.constructor?.prototype;
+        const cfiProto = renditionInternal.epubcfi?.constructor?.prototype;
         if (cfiProto && typeof cfiProto.toRange === "function" && !cfiProto._patchedToRange) {
             const origToRange = cfiProto.toRange;
-            cfiProto.toRange = function (_doc: Document, ignoreClass?: string) {
+            cfiProto.toRange = function (this: EpubCfiInstance, _doc: Document, ignoreClass?: string): Range | null {
                 try {
                     return origToRange.call(this, _doc, ignoreClass);
-                } catch (err) {
+                } catch {
                     try {
-                        const doc = _doc || document;
+                        const doc = _doc || activeDocument;
                         const range = doc.createRange();
                         const needsIgnoring = ignoreClass ? doc.querySelector("." + ignoreClass) != null : false;
-                        const ig = needsIgnoring ? ignoreClass : null;
-                        const clampSet = (isStart: boolean, steps: any[], offset: any) => {
+                        const ig: string | null = needsIgnoring && ignoreClass ? ignoreClass : null;
+                        const clampSet = (isStart: boolean, steps: unknown[], offset: unknown): boolean => {
                             const node = this.findNode(steps, doc, ig);
                             if (!node) return false;
                             const maxLen = node.nodeType === 3 ? (node.textContent?.length ?? 0) : (node.childNodes?.length ?? 0);
@@ -179,22 +282,30 @@ export class KindleEpubView extends ItemView {
         }
 
         // 4. Disable premature Annotations.inject (which runs in hooks.render BEFORE Themes.inject)
-        const annots = this.rendition.annotations as any;
+        const annots = renditionInternal.annotations;
         if (annots && !annots._patchedInject) {
-            annots.inject = function (_view: any) {
+            annots.inject = function (): void {
                 // Handled by renderHighlightsForActiveViews() after hooks.content (Themes) completes
             };
             annots._patchedInject = true;
         }
     }
 
-    private destroyCurrentBook() {
+    private destroyCurrentBook(): void {
         if (this.rendition) {
-            try { this.rendition.destroy(); } catch (e) {}
+            try {
+                this.rendition.destroy();
+            } catch {
+                /* ignore rendition destroy error */
+            }
             this.rendition = null;
         }
         if (this.book) {
-            try { this.book.destroy(); } catch (e) {}
+            try {
+                this.book.destroy();
+            } catch {
+                /* ignore book destroy error */
+            }
             this.book = null;
         }
     }
@@ -227,12 +338,12 @@ export class KindleEpubView extends ItemView {
         const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
 
         this.book = ePub(arrayBuffer);
-        
+
         try {
             const meta = await this.book.loaded.metadata;
             this.currentTitle = meta.title || "Book";
             this.titleSpan.setText(this.currentTitle);
-        } catch (e) {
+        } catch {
             this.titleSpan.setText("Book");
         }
 
@@ -247,17 +358,23 @@ export class KindleEpubView extends ItemView {
         this.registerThemes();
         this.applyCurrentTheme();
 
+        const renditionEvents = this.rendition as unknown as RenditionInternal;
+
         // "rendered" fires AFTER hooks.content (Themes.inject) has applied fonts and line-height
-        this.rendition.on("rendered", (_section: any, view: any) => {
+        renditionEvents.on("rendered", (_section: unknown, view: unknown) => {
+            const epubView = view as EpubViewInstance | undefined;
             try {
-                if (view && typeof view.expand === "function") {
-                    view.expand();
+                if (epubView && typeof epubView.expand === "function") {
+                    epubView.expand();
                 }
-            } catch (e) {}
+            } catch {
+                /* ignore expand errors during transitional layout */
+            }
             this.renderHighlightsForActiveViews();
         });
 
-        this.rendition.on("relocated", (location: any) => {
+        renditionEvents.on("relocated", (locArg: unknown) => {
+            const location = locArg as LocationPayload | undefined;
             if (location?.start?.displayed?.page) {
                 const page = location.start.displayed.page;
                 const total = location.start.displayed.total;
@@ -285,9 +402,10 @@ export class KindleEpubView extends ItemView {
 
         if (fs.existsSync(indexPath)) {
             try {
-                const index = JSON.parse(fs.readFileSync(indexPath, "utf-8"));
-                if (index[bookId] && Array.isArray(index[bookId].highlights)) {
-                    this.currentHighlights = index[bookId].highlights;
+                const index = JSON.parse(fs.readFileSync(indexPath, "utf-8")) as Record<string, BooksIndexRecord>;
+                const highlights = index[bookId]?.highlights;
+                if (Array.isArray(highlights)) {
+                    this.currentHighlights = highlights;
                 }
             } catch (e) {
                 console.error("Failed to load highlights from index:", e);
@@ -295,9 +413,10 @@ export class KindleEpubView extends ItemView {
         }
     }
 
-    private getActiveViewsList(): any[] {
+    private getActiveViewsList(): EpubViewInstance[] {
         if (!this.rendition) return [];
-        const viewsObj = (this.rendition as any).views?.();
+        const renditionInternal = this.rendition as unknown as RenditionInternal;
+        const viewsObj = renditionInternal.views?.();
         if (!viewsObj) return [];
         if (Array.isArray(viewsObj)) return viewsObj;
         if (typeof viewsObj.all === "function") return viewsObj.all();
@@ -317,7 +436,9 @@ export class KindleEpubView extends ItemView {
                 for (const cfi of Object.keys(view.highlights)) {
                     try {
                         view.unhighlight(cfi);
-                    } catch (e) {}
+                    } catch {
+                        /* ignore stale CFI removal error */
+                    }
                 }
             }
 
@@ -335,13 +456,13 @@ export class KindleEpubView extends ItemView {
                     if (!rng) continue;
 
                     const isActive =
-                        this.previousActiveHighlight &&
+                        this.previousActiveHighlight !== null &&
                         (this.previousActiveHighlight.range_cfi === h.range_cfi ||
-                            (this.previousActiveHighlight.point_cfi &&
+                            (Boolean(this.previousActiveHighlight.point_cfi) &&
                                 this.previousActiveHighlight.point_cfi === h.point_cfi));
 
                     const className = isActive ? "kindle-active-highlight" : "kindle-highlight";
-                    const styles = isActive
+                    const styles: Record<string, string> = isActive
                         ? {
                               fill: "#ff9800",
                               "fill-opacity": "0.35",
@@ -358,7 +479,7 @@ export class KindleEpubView extends ItemView {
                     view.highlight(
                         h.range_cfi,
                         { text: h.text || "", point_cfi: h.point_cfi || "" },
-                        () => {},
+                        () => undefined,
                         className,
                         styles
                     );
@@ -369,11 +490,13 @@ export class KindleEpubView extends ItemView {
 
             try {
                 view.pane?.render();
-            } catch (e) {}
+            } catch {
+                /* ignore pane render error */
+            }
         }
     }
 
-    private findMatchingHighlight(openAt: string): any {
+    private findMatchingHighlight(openAt: string): HighlightEntry | null {
         if (!openAt || !this.currentHighlights.length) return null;
 
         // 1. Exact match on point_cfi or range_cfi
@@ -382,7 +505,7 @@ export class KindleEpubView extends ItemView {
         }
 
         // 2. Normalized digits & colons match
-        const clean = (s: string) => (s || "").replace(/[^0-9:]/g, "");
+        const clean = (s?: string): string => (s || "").replace(/[^0-9:]/g, "");
         const cleanOpen = clean(openAt);
 
         for (const h of this.currentHighlights) {
@@ -396,7 +519,7 @@ export class KindleEpubView extends ItemView {
             const spineIdx = spineStep / 2 - 1;
             const elemPrefix = elemMatch[2];
             const targetOffset = parseInt(elemMatch[3], 10);
-            let best: any = null;
+            let best: HighlightEntry | null = null;
             let bestDiff = Infinity;
             for (const h of this.currentHighlights) {
                 if (
@@ -424,7 +547,7 @@ export class KindleEpubView extends ItemView {
         return null;
     }
 
-    private registerThemes() {
+    private registerThemes(): void {
         if (!this.rendition) return;
 
         this.rendition.themes.register("auto-dark", {
@@ -460,8 +583,9 @@ export class KindleEpubView extends ItemView {
             "a": { "color": "#8b5a2b !important" }
         });
 
-        this.rendition.hooks.content.register((contents: any) => {
-            contents.addStylesheetCss(`
+        this.rendition.hooks.content.register((contentsObj: unknown) => {
+            const contents = contentsObj as ContentsLike | undefined;
+            contents?.addStylesheetCss(`
                 svg g.kindle-highlight rect, svg g[ref="kindle-highlight"] rect {
                     fill: #ffd600 !important;
                     fill-opacity: 0.22 !important;
@@ -484,9 +608,9 @@ export class KindleEpubView extends ItemView {
         });
     }
 
-    private applyCurrentTheme() {
+    private applyCurrentTheme(): void {
         if (!this.rendition) return;
-        const isDark = document.body.hasClass("theme-dark");
+        const isDark = activeDocument.body.hasClass("theme-dark");
 
         if (this.currentTheme === "auto") {
             this.rendition.themes.select(isDark ? "auto-dark" : "auto-light");
@@ -497,23 +621,27 @@ export class KindleEpubView extends ItemView {
         } else if (this.currentTheme === "sepia") {
             this.rendition.themes.select("sepia");
         }
-        setTimeout(() => this.renderHighlightsForActiveViews(), 60);
+        window.setTimeout(() => this.renderHighlightsForActiveViews(), 60);
     }
 
-    private cycleTheme() {
+    private cycleTheme(): void {
         const order: ("auto" | "sepia" | "dark" | "light")[] = ["auto", "sepia", "dark", "light"];
         const nextIdx = (order.indexOf(this.currentTheme) + 1) % order.length;
         this.currentTheme = order[nextIdx];
         this.applyCurrentTheme();
     }
 
-    private changeFontSize(delta: number) {
+    private changeFontSize(delta: number): void {
         this.fontSize = Math.max(70, Math.min(200, this.fontSize + delta));
         if (this.rendition) {
             this.rendition.themes.fontSize(`${this.fontSize}%`);
-            setTimeout(() => {
+            window.setTimeout(() => {
                 for (const v of this.getActiveViewsList()) {
-                    try { v.expand?.(); } catch (e) {}
+                    try {
+                        v.expand?.();
+                    } catch {
+                        /* ignore expand error */
+                    }
                 }
                 this.renderHighlightsForActiveViews();
             }, 60);
@@ -528,13 +656,13 @@ export class KindleEpubView extends ItemView {
         if (openAt.startsWith("search:")) {
             const query = openAt.slice(7);
             try {
-                // @ts-ignore
-                const results = await this.book?.find(query);
+                const bookObj = this.book as unknown as { find?: (q: string) => Promise<Array<{ cfi: string }>> } | null;
+                const results = await bookObj?.find?.(query);
                 if (results && results.length > 0) {
                     const foundCfi = results[0].cfi;
                     this.previousActiveHighlight = { range_cfi: foundCfi, point_cfi: foundCfi, text: query };
                     await this.rendition.display(foundCfi);
-                    await new Promise((r) => setTimeout(r, 60));
+                    await new Promise<void>((r) => window.setTimeout(r, 60));
                     await this.rendition.display(foundCfi);
                     this.renderHighlightsForActiveViews();
                 }
@@ -574,24 +702,34 @@ export class KindleEpubView extends ItemView {
         const targetSpineIdx = spineMatch ? parseInt(spineMatch[1], 10) / 2 - 1 : -1;
         const wasSectionAlreadyLoaded = this.getActiveViewsList().some((v) => v.index === targetSpineIdx);
 
+        const renditionInternal = this.rendition as unknown as RenditionInternal;
+
         const safeDisplay = async (cfi?: string): Promise<boolean> => {
             if (!this.rendition) return false;
             try {
                 const timeoutPromise = new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error("Display timeout")), 4000)
+                    window.setTimeout(() => reject(new Error("Display timeout")), 4000)
                 );
                 await Promise.race([this.rendition.display(cfi), timeoutPromise]);
                 return true;
             } catch (err) {
                 console.warn("safeDisplay error for:", cfi, err);
-                const displaying = (this.rendition as any)?.displaying;
+                const displaying = renditionInternal.displaying;
                 if (displaying && typeof displaying.resolve === "function") {
-                    try { displaying.resolve(); } catch (e) {}
+                    try {
+                        displaying.resolve();
+                    } catch {
+                        /* ignore displaying promise resolve error */
+                    }
                 }
-                const q = (this.rendition as any)?.q;
+                const q = renditionInternal.q;
                 if (q && q.running) {
                     q.running = false;
-                    try { q.run(); } catch (e) {}
+                    try {
+                        q.run();
+                    } catch {
+                        /* ignore queue rerun error */
+                    }
                 }
                 return false;
             }
@@ -614,9 +752,13 @@ export class KindleEpubView extends ItemView {
 
         // If section was just loaded, wait for Themes.inject (hooks.content) to finish, expand columns, and re-align page
         if (!wasSectionAlreadyLoaded && displayed && navCfi) {
-            await new Promise((r) => setTimeout(r, 60));
+            await new Promise<void>((r) => window.setTimeout(r, 60));
             for (const v of this.getActiveViewsList()) {
-                try { v.expand?.(); } catch (e) {}
+                try {
+                    v.expand?.();
+                } catch {
+                    /* ignore expand error */
+                }
             }
             await safeDisplay(navCfi);
         }

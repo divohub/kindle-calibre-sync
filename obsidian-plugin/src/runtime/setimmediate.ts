@@ -1,8 +1,10 @@
 // Modern Obsidian Desktop shim for setimmediate (used by JSZip) without Function() or script elements.
-const scope = globalThis as unknown as {
-	setImmediate?: unknown;
-	clearImmediate?: unknown;
-};
+interface WindowWithImmediate {
+	setImmediate?: (callback: (...args: unknown[]) => void, ...args: unknown[]) => number;
+	clearImmediate?: (handle: number) => void;
+}
+
+const scope = window as unknown as WindowWithImmediate;
 
 if (!scope.setImmediate) {
 	scope.setImmediate = (callback: (...args: unknown[]) => void, ...args: unknown[]) => {

@@ -1,13 +1,16 @@
 import {
     Plugin,
+    Workspace,
     WorkspaceLeaf,
     Notice,
     PluginSettingTab,
     App,
     Setting,
+    SettingDefinitionItem,
     PaneType,
     OpenViewState,
-    MarkdownView
+    MarkdownView,
+    EditorPosition
 } from "obsidian";
 import { spawn, execFileSync } from "child_process";
 import * as path from "path";
@@ -21,6 +24,26 @@ interface KindleCalibreSettings {
     autoOpenReader: boolean;
 }
 
+interface ElectronModule {
+    shell?: {
+        openExternal?: (url: string, options?: unknown) => Promise<void>;
+    };
+}
+
+interface WindowWithRequire extends Window {
+    require?: (moduleId: string) => ElectronModule;
+}
+
+interface EditorWithMouse {
+    posAtMouse?: (evt: MouseEvent) => EditorPosition | null;
+    getCursor: () => EditorPosition;
+    getLine: (line: number) => string;
+}
+
+interface BooksIndexEntry {
+    epub_path?: string;
+}
+
 const DEFAULT_SETTINGS: KindleCalibreSettings = {
     pythonPath: "python3",
     scriptPath: "/home/divo/Work/kindle-calibre-sync/kindle_sync.py",
@@ -28,11 +51,13 @@ const DEFAULT_SETTINGS: KindleCalibreSettings = {
     autoOpenReader: true,
 };
 
+const CALIBRE_LINK_RE = /(calibre:\/\/view-book\/[^\s)"'>]+|kindle-read:\/\/[^\s)"'>]+)/;
+
 export default class KindleCalibrePlugin extends Plugin {
     settings: KindleCalibreSettings = DEFAULT_SETTINGS;
-    private origOpenLinkText: any = null;
-    private origOpenExternal: any = null;
-    private origWindowOpen: any = null;
+    private origOpenLinkText: Workspace["openLinkText"] | null = null;
+    private origOpenExternal: ((url: string, options?: unknown) => Promise<void>) | null = null;
+    private origWindowOpen: typeof window.open | null = null;
 
     async onload(): Promise<void> {
         await this.loadSettings();
@@ -63,13 +88,13 @@ export default class KindleCalibrePlugin extends Plugin {
 
         // 4. Intercept Obsidian's 'open-url' event (fired right before OS external browser/viewer is launched)
         this.registerDomEvent(
-            window as any,
-            "open-url" as any,
-            (evt: CustomEvent) => {
-                const url = evt.detail?.url;
+            window,
+            "open-url" as keyof WindowEventMap,
+            (evt: Event) => {
+                const url = (evt as CustomEvent<{ url?: string }>).detail?.url;
                 if (typeof url === "string" && (url.startsWith("calibre://view-book/") || url.startsWith("kindle-read://"))) {
                     evt.preventDefault();
-                    this.handleCalibreLink(url);
+                    void this.handleCalibreLink(url);
                 }
             }
         );
@@ -79,42 +104,43 @@ export default class KindleCalibrePlugin extends Plugin {
             window,
             "click",
             (evt: MouseEvent) => {
-                const target = evt.target as HTMLElement;
+                const target = evt.target as HTMLElement | null;
                 if (!target) return;
 
                 let linkUrl = "";
 
-                // 1. Direct anchor tag (Reading View or rendered markdown)
+                // Direct anchor tag (Reading View or rendered markdown)
                 const a = target.closest("a");
-                const href = a?.getAttribute("href") || (a as any)?.dataset?.href;
+                const href = a?.getAttribute("href") || a?.dataset?.href;
                 if (href && (href.startsWith("calibre://view-book/") || href.startsWith("kindle-read://"))) {
                     linkUrl = href;
                 }
 
-                // 2. Live preview / CodeMirror link element
+                // Live preview / CodeMirror link element
                 if (!linkUrl) {
                     const cmLink = target.closest(".cm-link, .cm-underline, .cm-url, .external-link");
                     if (cmLink) {
                         try {
                             const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
-                            const editor = mdView?.editor;
+                            const editor = mdView?.editor as unknown as EditorWithMouse | undefined;
                             if (editor) {
-                                // @ts-ignore
-                                const pos = editor.posAtMouse ? (editor as any).posAtMouse(evt) : editor.getCursor();
+                                const pos = editor.posAtMouse ? editor.posAtMouse(evt) : editor.getCursor();
                                 if (pos) {
                                     const lineText = editor.getLine(pos.line) || "";
-                                    const m = lineText.match(/(calibre:\/\/view-book\/[^\s\)\"\'\>]+|kindle-read:\/\/[^\s\)\"\'\>]+)/);
+                                    const m = lineText.match(CALIBRE_LINK_RE);
                                     if (m) {
                                         linkUrl = m[1];
                                     }
                                 }
                             }
-                        } catch (e) {}
+                        } catch {
+                            /* fallback to DOM line text inspection below */
+                        }
 
                         if (!linkUrl) {
                             const lineEl = target.closest(".cm-line");
                             const text = lineEl?.textContent || cmLink.parentElement?.textContent || "";
-                            const m = text.match(/(calibre:\/\/view-book\/[^\s\)\"\'\>]+|kindle-read:\/\/[^\s\)\"\'\>]+)/);
+                            const m = text.match(CALIBRE_LINK_RE);
                             if (m) {
                                 linkUrl = m[1];
                             }
@@ -126,42 +152,44 @@ export default class KindleCalibrePlugin extends Plugin {
                     evt.preventDefault();
                     evt.stopPropagation();
                     evt.stopImmediatePropagation();
-                    this.handleCalibreLink(linkUrl);
+                    void this.handleCalibreLink(linkUrl);
                 }
             },
-            true // Capture phase: runs before CodeMirror and Obsidian external link handlers!
+            true // Capture phase: runs before CodeMirror and Obsidian external link handlers
         );
 
-        // 5. Intercept Electron's shell.openExternal (prevents OS from opening calibre-viewer!)
+        // 6. Intercept Electron's shell.openExternal (prevents OS from opening calibre-viewer)
         try {
-            // @ts-ignore
-            const electron = (window as any).require ? (window as any).require("electron") : null;
+            const win = window as WindowWithRequire;
+            const electron = win.require ? win.require("electron") : null;
             if (electron?.shell?.openExternal) {
                 this.origOpenExternal = electron.shell.openExternal.bind(electron.shell);
-                electron.shell.openExternal = async (url: string, options?: any) => {
+                electron.shell.openExternal = async (url: string, options?: unknown) => {
                     if (typeof url === "string" && (url.startsWith("calibre://view-book/") || url.startsWith("kindle-read://"))) {
                         await this.handleCalibreLink(url);
                         return;
                     }
-                    return this.origOpenExternal(url, options);
+                    if (this.origOpenExternal) {
+                        return this.origOpenExternal(url, options);
+                    }
                 };
             }
-        } catch (e) {
-            console.warn("Could not patch electron.shell.openExternal", e);
+        } catch (err) {
+            console.warn("Could not patch electron.shell.openExternal", err);
         }
 
-        // 6. Intercept window.open
-        this.origWindowOpen = window.open;
+        // 7. Intercept window.open
+        this.origWindowOpen = window.open.bind(window);
         window.open = (url?: string | URL, target?: string, features?: string) => {
             const urlStr = url ? url.toString() : "";
             if (urlStr.startsWith("calibre://view-book/") || urlStr.startsWith("kindle-read://")) {
-                this.handleCalibreLink(urlStr);
+                void this.handleCalibreLink(urlStr);
                 return null;
             }
-            return this.origWindowOpen.call(window, url, target, features);
+            return this.origWindowOpen ? this.origWindowOpen(url, target, features) : null;
         };
 
-        // 7. Monkey-patch app.workspace.openLinkText for Live Preview / internal dispatch
+        // 8. Monkey-patch app.workspace.openLinkText for Live Preview / internal dispatch
         this.origOpenLinkText = this.app.workspace.openLinkText.bind(this.app.workspace);
         this.app.workspace.openLinkText = async (
             linktext: string,
@@ -173,14 +201,16 @@ export default class KindleCalibrePlugin extends Plugin {
                 await this.handleCalibreLink(linktext);
                 return;
             }
-            return this.origOpenLinkText(linktext, sourcePath, newLeaf, openViewState);
+            if (this.origOpenLinkText) {
+                return this.origOpenLinkText(linktext, sourcePath, newLeaf, openViewState);
+            }
         };
 
-        // 8. Settings Tab
+        // 9. Settings Tab
         this.addSettingTab(new KindleCalibreSettingTab(this.app, this));
     }
 
-    async onunload(): Promise<void> {
+    onunload(): void {
         if (this.origOpenLinkText) {
             this.app.workspace.openLinkText = this.origOpenLinkText;
         }
@@ -188,17 +218,19 @@ export default class KindleCalibrePlugin extends Plugin {
             window.open = this.origWindowOpen;
         }
         try {
-            // @ts-ignore
-            const electron = (window as any).require ? (window as any).require("electron") : null;
+            const win = window as WindowWithRequire;
+            const electron = win.require ? win.require("electron") : null;
             if (this.origOpenExternal && electron?.shell) {
                 electron.shell.openExternal = this.origOpenExternal;
             }
-        } catch (e) {}
-        this.app.workspace.detachLeavesOfType(VIEW_TYPE_KINDLE_EPUB);
+        } catch {
+            /* ignore if electron shell is unavailable during unload */
+        }
     }
 
     async loadSettings(): Promise<void> {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        const stored = (await this.loadData()) as Partial<KindleCalibreSettings> | null;
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, stored ?? {});
     }
 
     async saveSettings(): Promise<void> {
@@ -210,14 +242,14 @@ export default class KindleCalibrePlugin extends Plugin {
         const existingLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_KINDLE_EPUB);
         if (existingLeaves.length > 0) {
             const leaf = existingLeaves[0];
-            this.app.workspace.revealLeaf(leaf);
+            void this.app.workspace.revealLeaf(leaf);
             return leaf;
         }
 
         // Otherwise split vertically next to active note
         const leaf = this.app.workspace.getLeaf("split", "vertical");
         await leaf.setViewState({ type: VIEW_TYPE_KINDLE_EPUB, active: true });
-        this.app.workspace.revealLeaf(leaf);
+        void this.app.workspace.revealLeaf(leaf);
         return leaf;
     }
 
@@ -228,11 +260,14 @@ export default class KindleCalibrePlugin extends Plugin {
 
         if (fs.existsSync(indexPath)) {
             try {
-                const index = JSON.parse(fs.readFileSync(indexPath, "utf-8"));
-                if (index[bookId]?.epub_path && fs.existsSync(index[bookId].epub_path)) {
-                    return index[bookId].epub_path;
+                const index = JSON.parse(fs.readFileSync(indexPath, "utf-8")) as Record<string, BooksIndexEntry>;
+                const indexedPath = index[bookId]?.epub_path;
+                if (indexedPath && fs.existsSync(indexedPath)) {
+                    return indexedPath;
                 }
-            } catch (e) {}
+            } catch {
+                /* fallback to direct Calibre directory scan */
+            }
         }
 
         // 2. Direct folder lookup in Calibre Library
@@ -270,7 +305,9 @@ export default class KindleCalibrePlugin extends Plugin {
                         }
                     }
                 }
-            } catch (e) {}
+            } catch {
+                /* ignore inaccessible Calibre directory entries */
+            }
         }
 
         return null;
@@ -301,7 +338,7 @@ export default class KindleCalibrePlugin extends Plugin {
             await view.loadBook(epubPath, openAt, bookId, this.settings.scriptPath);
         } catch (err) {
             console.error("Kindle Calibre link error:", err);
-            new Notice("Error opening book link: " + err);
+            new Notice("Error opening book link: " + String(err));
         }
     }
 
@@ -312,11 +349,11 @@ export default class KindleCalibrePlugin extends Plugin {
         let stdout = "";
         let stderr = "";
 
-        proc.stdout.on("data", (data) => {
+        proc.stdout.on("data", (data: Buffer) => {
             stdout += data.toString();
         });
 
-        proc.stderr.on("data", (data) => {
+        proc.stderr.on("data", (data: Buffer) => {
             stderr += data.toString();
         });
 
@@ -337,6 +374,56 @@ class KindleCalibreSettingTab extends PluginSettingTab {
     constructor(app: App, plugin: KindleCalibrePlugin) {
         super(app, plugin);
         this.plugin = plugin;
+    }
+
+    getSettingDefinitions(): SettingDefinitionItem[] {
+        return [
+            {
+                name: "Python executable",
+                desc: "System path to python3 binary",
+                control: {
+                    type: "text",
+                    key: "pythonPath",
+                    defaultValue: DEFAULT_SETTINGS.pythonPath,
+                },
+            },
+            {
+                name: "Sync script path",
+                desc: "Absolute path to kindle_sync.py",
+                control: {
+                    type: "text",
+                    key: "scriptPath",
+                    defaultValue: DEFAULT_SETTINGS.scriptPath,
+                },
+            },
+            {
+                name: "Calibre library path",
+                desc: "Path to Calibre Library folder containing metadata.db",
+                control: {
+                    type: "text",
+                    key: "calibreLibraryPath",
+                    defaultValue: DEFAULT_SETTINGS.calibreLibraryPath,
+                },
+            },
+            {
+                name: "Auto-open reader",
+                desc: "Open side-by-side book reader when clicking a highlight location",
+                control: {
+                    type: "toggle",
+                    key: "autoOpenReader",
+                    defaultValue: DEFAULT_SETTINGS.autoOpenReader,
+                },
+            },
+        ];
+    }
+
+    getControlValue(key: string): unknown {
+        return this.plugin.settings[key as keyof KindleCalibreSettings];
+    }
+
+    async setControlValue(key: string, value: unknown): Promise<void> {
+        (this.plugin.settings as unknown as Record<string, unknown>)[key] = value;
+        await this.plugin.saveSettings();
     }
 
     display(): void {
