@@ -1,4 +1,4 @@
-# Kindle <-> Calibre <-> Obsidian Highlight Bridge
+# Kindle Calibre Sync
 
 Automatic bridge for syncing Kindle highlights and notes directly into Calibre and Obsidian.
 
