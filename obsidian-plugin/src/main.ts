@@ -11,17 +11,26 @@ import {
 	PluginSettingTab,
 	Setting,
 	SettingDefinitionItem,
+	TFile,
 	Workspace,
 	WorkspaceLeaf,
 } from "obsidian";
-import { execFile } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
-import { promisify } from "util";
 import { detectCalibreLibraryPath } from "./sync/calibreDb";
-import { detectKindleClippingsPath } from "./sync/clippingsParser";
+import {
+	describeDetectedSyncSources,
+	detectSyncSourcesAsync,
+	saveKsdkDbCache,
+	type DetectedSyncSources,
+} from "./sync/ksdkDbReader";
 import { resolveHighlightsFolder } from "./sync/obsidianExporter";
-import { buildBooksIndexFromCalibre, runNativeSync } from "./sync/syncService";
+import {
+	buildBooksIndexFromCalibre,
+	prepareBookEpubForViewer,
+	runNativeSync,
+	type PreparedBookEpubResult,
+} from "./sync/syncService";
 import type {
 	BooksIndex,
 	HighlightEntry,
@@ -29,8 +38,6 @@ import type {
 	StoredPluginData,
 } from "./types";
 import { KindleEpubView, VIEW_TYPE_KINDLE_EPUB } from "./view";
-
-const execFileAsync = promisify(execFile);
 
 interface ElectronModule {
 	shell?: {
@@ -48,15 +55,18 @@ interface EditorWithMouse {
 	getLine: (line: number) => string;
 }
 
-interface ClippingsSource {
-	path: string;
-	content?: string;
+interface SyncSourceBundle {
+	clippingsSource: { path: string; content?: string } | null;
+	ksdkDb: { path: string; data: Uint8Array } | null;
+	extraKfxDirs: string[];
+	label: string;
 }
 
 const DEFAULT_SETTINGS: KindleCalibreSettings = {
 	calibreLibraryPath: "",
 	highlightsFolder: "",
 	clippingsPath: "",
+	ksdkDbPath: "",
 	injectCalibreAnnotations: true,
 	autoOpenReader: true,
 	calibreLibraryId: "Calibre_Library",
@@ -69,17 +79,31 @@ function isCalibreBookLink(url: string): boolean {
 }
 
 class ClippingsPickerModal extends Modal {
-	private readonly onSelect: (source: ClippingsSource, rememberPath?: string) => void;
-	private readonly onRetryUsb: () => ClippingsSource | null;
+	private readonly onSelect: (
+		bundle: SyncSourceBundle,
+		rememberClippingsPath?: string,
+		rememberKsdkPath?: string
+	) => void;
+	private readonly onRetryUsb: () => Promise<DetectedSyncSources>;
+	private readonly initialResult: DetectedSyncSources;
+	private readonly vaultBasePath?: string;
 
 	constructor(
 		app: App,
-		onRetryUsb: () => ClippingsSource | null,
-		onSelect: (source: ClippingsSource, rememberPath?: string) => void
+		onRetryUsb: () => Promise<DetectedSyncSources>,
+		onSelect: (
+			bundle: SyncSourceBundle,
+			rememberClippingsPath?: string,
+			rememberKsdkPath?: string
+		) => void,
+		initialResult: DetectedSyncSources,
+		vaultBasePath?: string
 	) {
 		super(app);
 		this.onRetryUsb = onRetryUsb;
 		this.onSelect = onSelect;
+		this.initialResult = initialResult;
+		this.vaultBasePath = vaultBasePath;
 	}
 
 	onOpen(): void {
@@ -87,14 +111,16 @@ class ClippingsPickerModal extends Modal {
 		contentEl.empty();
 
 		contentEl.createEl("h3", { text: "Kindle device not detected" });
-		contentEl.createEl("p", {
+		const descEl = contentEl.createEl("p", {
 			cls: "kindle-modal-desc",
-			text: "Connect your Kindle via USB (looks for documents/My Clippings.txt), or choose a local My Clippings.txt file.",
+			text:
+				this.initialResult.mtpWarning ||
+				"Connect your Kindle via USB (USB drive or MTP), unlock its screen, or choose a local My Clippings.txt or ksdk_annotation_v1.db file.",
 		});
 
 		const fileInput = contentEl.createEl("input", {
 			cls: "kindle-hidden-file-input",
-			attr: { type: "file", accept: ".txt,text/plain" },
+			attr: { type: "file", accept: ".txt,.db,text/plain" },
 		});
 
 		fileInput.addEventListener("change", () => {
@@ -103,33 +129,116 @@ class ClippingsPickerModal extends Modal {
 
 			const maybePath = (file as { path?: unknown }).path;
 			const fsPath = typeof maybePath === "string" ? maybePath : "";
+			const pickedPath = fsPath || file.name;
+			const isDb = file.name.toLowerCase().endsWith(".db");
+
+			if (isDb) {
+				void file.arrayBuffer().then(async (buf) => {
+					const data = new Uint8Array(buf);
+					await saveKsdkDbCache(data, this.vaultBasePath);
+					const fallbackClip = this.initialResult.fallbackClippingsSource;
+					const labelParts = [
+						fallbackClip ? "legacy My Clippings.txt" : "",
+						"selected ksdk_annotation_v1.db",
+					].filter(Boolean);
+					this.close();
+					this.onSelect(
+						{
+							clippingsSource: fallbackClip,
+							ksdkDb: { path: pickedPath, data },
+							extraKfxDirs: [],
+							label: labelParts.join(" + "),
+						},
+						undefined,
+						fsPath && fs.existsSync(fsPath) ? fsPath : undefined
+					);
+				});
+				return;
+			}
 
 			void file.text().then((content) => {
-				const pickedPath = fsPath || file.name;
+				const fallbackDb = this.initialResult.fallbackKsdkDb;
+				const labelParts = [
+					"selected My Clippings.txt",
+					fallbackDb ? "cached ksdk_annotation_v1.db" : "",
+				].filter(Boolean);
 				this.close();
 				this.onSelect(
-					{ path: pickedPath, content },
-					fsPath && fs.existsSync(fsPath) ? fsPath : undefined
+					{
+						clippingsSource: { path: pickedPath, content },
+						ksdkDb: fallbackDb,
+						extraKfxDirs: [],
+						label: labelParts.join(" + "),
+					},
+					fsPath && fs.existsSync(fsPath) ? fsPath : undefined,
+					undefined
 				);
 			});
 		});
 
 		const actions = contentEl.createDiv({ cls: "kindle-modal-actions" });
 
-		const retryBtn = actions.createEl("button", { text: "Retry USB detection" });
+		const retryBtn = actions.createEl("button", { text: "Retry Kindle detection" });
 		retryBtn.addEventListener("click", () => {
-			const detected = this.onRetryUsb();
-			if (detected) {
-				this.close();
-				this.onSelect(detected);
-			} else {
-				new Notice("Still no Kindle USB drive found. Check USB cable or pick My Clippings.txt manually.");
-			}
+			retryBtn.disabled = true;
+			retryBtn.textContent = "Checking...";
+			void this.onRetryUsb()
+				.then((result) => {
+					if (result.clippingsSource || result.ksdkDb) {
+						this.close();
+						this.onSelect({
+							clippingsSource: result.clippingsSource,
+							ksdkDb: result.ksdkDb,
+							extraKfxDirs: result.extraKfxDirs,
+							label: describeDetectedSyncSources(result),
+						});
+						return;
+					}
+					if (result.mtpWarning) {
+						descEl.textContent = result.mtpWarning;
+						new Notice(result.mtpWarning, 6000);
+					} else {
+						new Notice(
+							"Still no Kindle device found. Unlock Kindle screen, check USB cable, or pick a local .db / .txt file."
+						);
+					}
+				})
+				.catch((err) => {
+					new Notice(`Detection error: ${err instanceof Error ? err.message : String(err)}`);
+				})
+				.finally(() => {
+					retryBtn.disabled = false;
+					retryBtn.textContent = "Retry Kindle detection";
+				});
 		});
+
+		if (this.initialResult.fallbackClippingsSource || this.initialResult.fallbackKsdkDb) {
+			const fallbackBtn = actions.createEl("button", {
+				text: "Use local/cached files",
+			});
+			fallbackBtn.addEventListener("click", () => {
+				const parts: string[] = [];
+				if (this.initialResult.fallbackClippingsSource) parts.push("My Clippings.txt");
+				if (this.initialResult.fallbackKsdkDb) {
+					parts.push(
+						this.initialResult.fallbackKsdkDb.fromCache
+							? "cached ksdk_annotation_v1.db"
+							: "ksdk_annotation_v1.db"
+					);
+				}
+				this.close();
+				this.onSelect({
+					clippingsSource: this.initialResult.fallbackClippingsSource,
+					ksdkDb: this.initialResult.fallbackKsdkDb,
+					extraKfxDirs: [],
+					label: `local fallback (${parts.join(" + ")})`,
+				});
+			});
+		}
 
 		const pickBtn = actions.createEl("button", {
 			cls: "mod-cta",
-			text: "Choose My Clippings.txt...",
+			text: "Choose .txt / .db file...",
 		});
 		pickBtn.addEventListener("click", () => {
 			fileInput.click();
@@ -145,6 +254,8 @@ export default class KindleCalibrePlugin extends Plugin {
 	settings: KindleCalibreSettings = { ...DEFAULT_SETTINGS };
 	booksIndex: BooksIndex = {};
 	private syncInProgress = false;
+	private detectingSource = false;
+	private preparingBooks = new Map<string, Promise<PreparedBookEpubResult | null>>();
 	private origOpenLinkText: Workspace["openLinkText"] | null = null;
 	private origOpenExternal: ((url: string, options?: unknown) => Promise<void>) | null = null;
 	private origWindowOpen: typeof window.open | null = null;
@@ -206,7 +317,8 @@ export default class KindleCalibrePlugin extends Plugin {
 				let linkUrl = "";
 
 				const a = target.closest("a");
-				const href = a?.getAttribute("href") || a?.dataset?.href;
+				const dataHrefEl = target.closest("[data-href]") as HTMLElement | null;
+				const href = a?.getAttribute("href") || a?.dataset?.href || dataHrefEl?.dataset?.href;
 				if (href && isCalibreBookLink(href)) {
 					linkUrl = href;
 				}
@@ -382,7 +494,7 @@ export default class KindleCalibrePlugin extends Plugin {
 		return leaf;
 	}
 
-	private async resolveEpubPath(bookId: string): Promise<string | null> {
+	private async resolveFallbackEpubPath(bookId: string): Promise<string | null> {
 		// 1. Check in-memory / stored booksIndex
 		const cachedPath = this.booksIndex[bookId]?.epub_path;
 		if (cachedPath && fs.existsSync(cachedPath)) {
@@ -407,50 +519,65 @@ export default class KindleCalibrePlugin extends Plugin {
 						return indexedPath;
 					}
 				} catch {
-					/* fallback to Calibre directory scan */
+					/* ignore malformed legacy books_index.json */
 				}
-			}
-		}
-
-		// 4. Direct folder lookup in auto-detected or configured Calibre Library (with optional ebook-convert fallback)
-		const libPath = detectCalibreLibraryPath(this.settings.calibreLibraryPath);
-		if (libPath && fs.existsSync(libPath)) {
-			try {
-				const authors = fs.readdirSync(libPath);
-				for (const auth of authors) {
-					const authDir = path.join(libPath, auth);
-					if (!fs.statSync(authDir).isDirectory()) continue;
-					const books = fs.readdirSync(authDir);
-					for (const bk of books) {
-						if (!bk.endsWith(`(${bookId})`)) continue;
-						const bkDir = path.join(authDir, bk);
-						const files = fs.readdirSync(bkDir);
-						const epub = files.find((f) => f.toLowerCase().endsWith(".epub"));
-						if (epub) return path.join(bkDir, epub);
-
-						const convertible = files.find((f) => {
-							const ext = path.extname(f).toLowerCase();
-							return ext === ".fb2" || ext === ".azw3" || ext === ".mobi";
-						});
-						if (convertible) {
-							const srcFile = path.join(bkDir, convertible);
-							const dstEpub = path.join(bkDir, `${path.basename(convertible, path.extname(convertible))}.epub`);
-							new Notice("EPUB format missing. Converting book with Calibre...");
-							try {
-								await execFileAsync("ebook-convert", [srcFile, dstEpub]);
-								if (fs.existsSync(dstEpub)) return dstEpub;
-							} catch (convErr) {
-								console.error("Auto ebook-convert failed:", convErr);
-							}
-						}
-					}
-				}
-			} catch {
-				/* ignore inaccessible Calibre directory entries */
 			}
 		}
 
 		return null;
+	}
+
+	private async prepareBookWithNotice(
+		bookId: string,
+		openAt: string,
+		noteFile: TFile | null
+	): Promise<PreparedBookEpubResult | null> {
+		const statusNotice = new Notice("Preparing EPUB for reader...", 0);
+		const task = (async (): Promise<PreparedBookEpubResult | null> => {
+			try {
+				const prepared = await prepareBookEpubForViewer({
+					app: this.app,
+					settings: this.settings,
+					bookId,
+					openAt,
+					noteFile,
+					onStatus: (msg) => {
+						statusNotice.setMessage(msg);
+					},
+				});
+
+				if (prepared) {
+					this.booksIndex[bookId] = prepared.bookRecord;
+					await this.saveSettings();
+					this.refreshOpenReaderHighlights();
+					statusNotice.hide();
+
+					const hlCount = prepared.bookRecord.highlights?.length ?? 0;
+					if (prepared.converted) {
+						new Notice(
+							`EPUB ready: "${prepared.bookRecord.title}" (${hlCount} highlights indexed).`,
+							5000
+						);
+					} else if (prepared.noteUpdated) {
+						new Notice(
+							`Updated EPUB links & indexed ${hlCount} highlights for "${prepared.bookRecord.title}".`,
+							4000
+						);
+					}
+
+					if (prepared.dbWarning) {
+						new Notice(prepared.dbWarning, 7000);
+					}
+				}
+				return prepared;
+			} finally {
+				this.preparingBooks.delete(bookId);
+				statusNotice.hide();
+			}
+		})();
+
+		this.preparingBooks.set(bookId, task);
+		return task;
 	}
 
 	async handleCalibreLink(url: string): Promise<void> {
@@ -465,16 +592,65 @@ export default class KindleCalibrePlugin extends Plugin {
 				openAt = decodeURIComponent(openAt);
 			}
 
-			const epubPath = await this.resolveEpubPath(bookId);
+			let epubPath = "";
+			let targetOpenAt = openAt;
+			let highlights: HighlightEntry[] | undefined = this.booksIndex[bookId]?.highlights;
+
+			// Fast path: EPUB exists, highlights are indexed, and link already uses an EPUB CFI
+			const cachedRec = this.booksIndex[bookId];
+			const cachedPath = cachedRec?.epub_path;
+			if (
+				cachedPath &&
+				fs.existsSync(cachedPath) &&
+				(cachedRec?.highlights?.length ?? 0) > 0 &&
+				!openAt.startsWith("search:")
+			) {
+				epubPath = cachedPath;
+				highlights = cachedRec.highlights;
+			} else {
+				const existingPrep = this.preparingBooks.get(bookId);
+				let prepared: PreparedBookEpubResult | null = null;
+				if (existingPrep) {
+					const waitNotice = new Notice("Waiting for ongoing EPUB preparation...", 0);
+					try {
+						prepared = await existingPrep;
+					} finally {
+						waitNotice.hide();
+					}
+					if (prepared) {
+						epubPath = prepared.epubPath;
+						highlights = this.booksIndex[bookId]?.highlights ?? prepared.bookRecord.highlights;
+					}
+				} else {
+					const activeFile = this.app.workspace.getActiveFile();
+					prepared = await this.prepareBookWithNotice(
+						bookId,
+						openAt,
+						activeFile instanceof TFile ? activeFile : null
+					);
+					if (prepared) {
+						epubPath = prepared.epubPath;
+						highlights = prepared.bookRecord.highlights;
+						if (prepared.resolvedOpenAt) {
+							targetOpenAt = prepared.resolvedOpenAt;
+						}
+					}
+				}
+
+				if (!epubPath) {
+					epubPath = (await this.resolveFallbackEpubPath(bookId)) || "";
+					highlights = this.booksIndex[bookId]?.highlights;
+				}
+			}
+
 			if (!epubPath) {
-				new Notice(`Book ID ${bookId} not found in Calibre library in EPUB format.`);
+				new Notice(`Book ID ${bookId} not found in Calibre library or cannot be converted to EPUB.`);
 				return;
 			}
 
-			const highlights: HighlightEntry[] | undefined = this.booksIndex[bookId]?.highlights;
 			const leaf = await this.openReaderLeaf();
 			const view = leaf.view as KindleEpubView;
-			await view.loadBook(epubPath, openAt, bookId, this.settings.scriptPath || "", highlights);
+			await view.loadBook(epubPath, targetOpenAt, bookId, this.settings.scriptPath || "", highlights);
 		} catch (err) {
 			console.error("Kindle Calibre link error:", err);
 			new Notice(`Error opening book link: ${err instanceof Error ? err.message : String(err)}`);
@@ -494,45 +670,81 @@ export default class KindleCalibrePlugin extends Plugin {
 	}
 
 	async runSync(): Promise<void> {
-		if (this.syncInProgress) {
+		if (this.syncInProgress || this.detectingSource) {
 			new Notice("Kindle sync is already running.");
 			return;
 		}
 
 		const vaultBasePath = this.getVaultBasePath();
-		const detected = detectKindleClippingsPath(this.settings.clippingsPath, vaultBasePath);
+		this.detectingSource = true;
+		const detectNotice = new Notice("Checking connected Kindle (USB/MTP)...", 0);
+		let detection: DetectedSyncSources;
+		try {
+			detection = await detectSyncSourcesAsync({
+				clippingsPath: this.settings.clippingsPath,
+				ksdkDbPath: this.settings.ksdkDbPath,
+				vaultBasePath,
+			});
+		} finally {
+			detectNotice.hide();
+			this.detectingSource = false;
+		}
 
-		if (detected) {
-			await this.executeSyncWithSource({ path: detected.path });
+		if (detection.clippingsSource || detection.ksdkDb) {
+			await this.executeSyncWithSource({
+				clippingsSource: detection.clippingsSource,
+				ksdkDb: detection.ksdkDb,
+				extraKfxDirs: detection.extraKfxDirs,
+				label: describeDetectedSyncSources(detection),
+			});
 			return;
 		}
 
 		const modal = new ClippingsPickerModal(
 			this.app,
-			() => {
-				const retry = detectKindleClippingsPath(this.settings.clippingsPath, vaultBasePath);
-				return retry ? { path: retry.path } : null;
-			},
-			(source, rememberPath) => {
-				if (rememberPath && !this.settings.clippingsPath) {
-					this.settings.clippingsPath = rememberPath;
+			() =>
+				detectSyncSourcesAsync({
+					clippingsPath: this.settings.clippingsPath,
+					ksdkDbPath: this.settings.ksdkDbPath,
+					vaultBasePath,
+				}),
+			(bundle, rememberClipPath, rememberKsdkPath) => {
+				let changed = false;
+				if (rememberClipPath && !this.settings.clippingsPath) {
+					this.settings.clippingsPath = rememberClipPath;
+					changed = true;
+				}
+				if (rememberKsdkPath && !this.settings.ksdkDbPath) {
+					this.settings.ksdkDbPath = rememberKsdkPath;
+					changed = true;
+				}
+				if (changed) {
 					void this.saveSettings();
 				}
-				void this.executeSyncWithSource(source);
-			}
+				void this.executeSyncWithSource(bundle);
+			},
+			detection,
+			vaultBasePath
 		);
 		modal.open();
 	}
 
-	private async executeSyncWithSource(source: ClippingsSource): Promise<void> {
+	private async executeSyncWithSource(bundle: SyncSourceBundle): Promise<void> {
 		this.syncInProgress = true;
-		const statusNotice = new Notice("Kindle: scanning highlights and matching Calibre books...", 0);
+		const sourceLabel = bundle.label || "My Clippings.txt";
+		const statusNotice = new Notice(
+			`Kindle (${sourceLabel}): scanning highlights and matching Calibre books...`,
+			0
+		);
 
 		try {
 			const result = await runNativeSync({
 				app: this.app,
 				settings: this.settings,
-				clippingsSource: source,
+				clippingsSource: bundle.clippingsSource,
+				ksdkDb: bundle.ksdkDb,
+				extraKfxDirs: bundle.extraKfxDirs,
+				autoConvertToEpub: true,
 				onProgress: (msg) => {
 					statusNotice.setMessage(msg);
 				},
@@ -547,10 +759,21 @@ export default class KindleCalibrePlugin extends Plugin {
 			const { summary } = result;
 			statusNotice.hide();
 
+			const convPart =
+				summary.epubsConverted && summary.epubsConverted > 0
+					? `, ${summary.epubsConverted} converted to EPUB`
+					: "";
 			const msg =
-				`Sync complete: ${summary.totalBooks} books (${summary.matchedBooks} in Calibre, ` +
+				`Sync complete (${sourceLabel}): ${summary.totalBooks} books (${summary.matchedBooks} in Calibre${convPart}, ` +
 				`${summary.cfiFound} CFIs, ${summary.notesUpdated} updates in "${summary.highlightsFolder}").`;
 			new Notice(msg, 6000);
+
+			if (summary.epubConversionWarnings?.length) {
+				new Notice(
+					`EPUB conversion warnings: ${summary.epubConversionWarnings.slice(0, 3).join("; ")}`,
+					8000
+				);
+			}
 
 			if (summary.calibreWarning) {
 				new Notice(summary.calibreWarning, 7000);
@@ -594,12 +817,21 @@ class KindleCalibreSettingTab extends PluginSettingTab {
 				},
 			},
 			{
-				name: "Fallback clippings file path",
+				name: "Legacy clippings file path",
 				desc: "Optional My Clippings.txt path when no Kindle USB drive is connected",
 				control: {
 					type: "text",
 					key: "clippingsPath",
 					defaultValue: DEFAULT_SETTINGS.clippingsPath,
+				},
+			},
+			{
+				name: "Kindle annotation DB path (ksdk_annotation_v1.db)",
+				desc: "Optional offline ksdk_annotation_v1.db path (auto-detected via Kindle MTP/USB and cached locally)",
+				control: {
+					type: "text",
+					key: "ksdkDbPath",
+					defaultValue: DEFAULT_SETTINGS.ksdkDbPath,
 				},
 			},
 			{
@@ -666,14 +898,27 @@ class KindleCalibreSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Fallback clippings file path")
-			.setDesc("Optional My Clippings.txt path used when Kindle USB drive is not connected")
+			.setName("Legacy clippings file path")
+			.setDesc("Optional My Clippings.txt path used when Kindle is not connected")
 			.addText((text) =>
 				text
-					.setPlaceholder("Auto-detected from Kindle USB or ~/My Clippings.txt")
+					.setPlaceholder("Auto-detected from Kindle USB/MTP or ~/My Clippings.txt")
 					.setValue(this.plugin.settings.clippingsPath)
 					.onChange(async (val) => {
 						this.plugin.settings.clippingsPath = val.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Kindle annotation DB path (ksdk_annotation_v1.db)")
+			.setDesc("Optional offline ksdk_annotation_v1.db path (auto-detected via Kindle MTP/USB and cached locally)")
+			.addText((text) =>
+				text
+					.setPlaceholder("Auto: Kindle MTP/USB or cached DB")
+					.setValue(this.plugin.settings.ksdkDbPath || "")
+					.onChange(async (val) => {
+						this.plugin.settings.ksdkDbPath = val.trim();
 						await this.plugin.saveSettings();
 					})
 			);

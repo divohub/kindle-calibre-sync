@@ -1,7 +1,7 @@
 {
   "id": "kindle-calibre-sync",
   "name": "Kindle Calibre Sync",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "minAppVersion": "1.0.0",
   "description": "Sync Kindle highlights with Calibre and read EPUB books side-by-side with your notes.",
   "author": "divo",

@@ -2,6 +2,7 @@ export interface KindleCalibreSettings {
 	calibreLibraryPath: string;
 	highlightsFolder: string;
 	clippingsPath: string;
+	ksdkDbPath?: string;
 	injectCalibreAnnotations: boolean;
 	autoOpenReader: boolean;
 	calibreLibraryId: string;
@@ -73,5 +74,7 @@ export interface SyncSummary {
 	injectedAnnots: number;
 	notesUpdated: number;
 	highlightsFolder: string;
+	epubsConverted?: number;
+	epubConversionWarnings?: string[];
 	calibreWarning?: string;
 }

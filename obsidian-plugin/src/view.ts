@@ -3,9 +3,38 @@ import ePub, { Book, Rendition } from "epubjs";
 import * as fs from "fs";
 import * as path from "path";
 import { spawn } from "child_process";
+import { buildEpubTextIndex, findCfiInIndex, type EpubTextIndex } from "./sync/epubCfi";
 import type { BooksIndexRecord, HighlightEntry } from "./types";
 
 export const VIEW_TYPE_KINDLE_EPUB = "kindle-epub-reader-view";
+
+const epubSearchIndexCache = new Map<string, EpubTextIndex>();
+
+function normalizeSearchQuery(text: string): string {
+    return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+async function getOrBuildEpubSearchIndex(epubPath: string): Promise<EpubTextIndex | null> {
+    if (!epubPath || !fs.existsSync(epubPath)) return null;
+    try {
+        const stat = fs.statSync(epubPath);
+        const key = `${epubPath}:${stat.mtimeMs}:${stat.size}`;
+        const cached = epubSearchIndexCache.get(key);
+        if (cached) return cached;
+        const built = await buildEpubTextIndex(epubPath);
+        if (built) {
+            // Keep cache bounded
+            if (epubSearchIndexCache.size > 8) {
+                const firstKey = epubSearchIndexCache.keys().next().value;
+                if (firstKey) epubSearchIndexCache.delete(firstKey);
+            }
+            epubSearchIndexCache.set(key, built);
+        }
+        return built;
+    } catch {
+        return await buildEpubTextIndex(epubPath);
+    }
+}
 
 interface EpubQueue {
     dequeue: () => unknown;
@@ -663,40 +692,125 @@ export class KindleEpubView extends ItemView {
         if (!this.rendition) return;
 
         this.lastOpenAtCfi = openAt;
+        let activeHighlightFromSearch: HighlightEntry | null = null;
 
         if (openAt.startsWith("search:")) {
-            const query = openAt.slice(7);
-            try {
-                const bookObj = this.book as unknown as { find?: (q: string) => Promise<Array<{ cfi: string }>> } | null;
-                const results = await bookObj?.find?.(query);
-                if (results && results.length > 0) {
-                    const foundCfi = results[0].cfi;
-                    this.previousActiveHighlight = { range_cfi: foundCfi, point_cfi: foundCfi, text: query };
-                    await this.rendition.display(foundCfi);
-                    await new Promise<void>((r) => window.setTimeout(r, 60));
-                    await this.rendition.display(foundCfi);
-                    this.renderHighlightsForActiveViews();
+            const query = openAt.slice(7).trim();
+            const qNorm = normalizeSearchQuery(query);
+            let resolvedCfi = "";
+
+            // 1. Try matching already-loaded highlights first (preserves orange active highlight box)
+            if (qNorm && this.currentHighlights.length > 0) {
+                for (const h of this.currentHighlights) {
+                    const hNorm = normalizeSearchQuery(h.text || "");
+                    if (!hNorm) continue;
+                    const minMatch = Math.min(qNorm.length, hNorm.length) >= 12;
+                    if (
+                        hNorm === qNorm ||
+                        (qNorm.length >= 8 && hNorm.includes(qNorm)) ||
+                        (minMatch && qNorm.includes(hNorm))
+                    ) {
+                        const cfi = h.range_cfi || h.point_cfi;
+                        if (cfi) {
+                            resolvedCfi = cfi;
+                            activeHighlightFromSearch = h;
+                            break;
+                        }
+                    }
                 }
-            } catch (e) {
-                console.warn("EPUB search error:", e);
             }
-            return;
+
+            // 2. Fallback: normalized EPUB text index (handles truncated snippets, Cyrillic, quotes/dashes)
+            if (!resolvedCfi && query && this.currentEpubPath) {
+                try {
+                    const idx = await getOrBuildEpubSearchIndex(this.currentEpubPath);
+                    const cfiInfo = idx ? findCfiInIndex(idx, query) : null;
+                    if (cfiInfo?.rangeCfi || cfiInfo?.fullCfi) {
+                        resolvedCfi = cfiInfo.rangeCfi || cfiInfo.fullCfi;
+                        activeHighlightFromSearch = {
+                            range_cfi: cfiInfo.rangeCfi,
+                            point_cfi: cfiInfo.fullCfi,
+                            spine_index: cfiInfo.spineIndex,
+                            text: query,
+                        };
+                    }
+                } catch (e) {
+                    console.warn("EPUB text-index search error:", e);
+                }
+            }
+
+            // 3. Last resort: iterate spine sections and use epub.js Section.find()
+            if (!resolvedCfi && query && this.book) {
+                try {
+                    const spineItems = (this.book.spine as unknown as {
+                        spineItems?: Array<{
+                            load: (loader: unknown) => Promise<unknown>;
+                            find?: (q: string) => Array<{ cfi: string }>;
+                            unload?: () => void;
+                        }>;
+                    })?.spineItems || [];
+                    const loader = this.book.load.bind(this.book);
+                    const subQueries = query.length > 48 ? [query, query.slice(0, 48)] : [query];
+                    outer: for (const section of spineItems) {
+                        try {
+                            await section.load(loader);
+                            for (const sq of subQueries) {
+                                const hits = section.find?.(sq) || [];
+                                if (hits.length > 0 && hits[0]?.cfi) {
+                                    resolvedCfi = hits[0].cfi;
+                                    activeHighlightFromSearch = {
+                                        range_cfi: resolvedCfi,
+                                        point_cfi: resolvedCfi,
+                                        text: query,
+                                    };
+                                    break outer;
+                                }
+                            }
+                        } catch {
+                            /* skip unreadable section */
+                        } finally {
+                            try {
+                                section.unload?.();
+                            } catch {
+                                /* ignore unload error */
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn("EPUB spine search error:", e);
+                }
+            }
+
+            if (!resolvedCfi) {
+                new Notice("Could not locate highlight in EPUB; opening book start.", 4000);
+                try {
+                    await this.rendition.display();
+                    this.renderHighlightsForActiveViews();
+                } catch (e) {
+                    console.warn("EPUB fallback display error:", e);
+                }
+                return;
+            }
+
+            openAt = resolvedCfi;
         }
 
-        const matched = this.findMatchingHighlight(openAt);
+        const matched = activeHighlightFromSearch || this.findMatchingHighlight(openAt);
         let targetCfi = openAt;
 
         if (matched && matched.range_cfi) {
             this.previousActiveHighlight = matched;
             targetCfi = matched.range_cfi;
         } else {
-            // Convert Calibre-style CFI to standard EPUB CFI for ePub.js
-            const m = targetCfi.match(/^epubcfi\(\/(\d+)(.*)\)$/);
-            if (m) {
-                const spineStep = m[1];
-                let docPath = m[2];
-                if (docPath.startsWith("/2/4/")) docPath = docPath.slice(2);
-                targetCfi = `epubcfi(/6/${spineStep}!${docPath})`;
+            // Convert Calibre-style CFI (/8/2/4/...) to standard ePub.js CFI (/6/8!/4/...) unless already standard
+            if (!targetCfi.includes("!")) {
+                const m = targetCfi.match(/^epubcfi\(\/(\d+)(.*)\)$/);
+                if (m) {
+                    const spineStep = m[1];
+                    let docPath = m[2];
+                    if (docPath.startsWith("/2/4/")) docPath = docPath.slice(2);
+                    targetCfi = `epubcfi(/6/${spineStep}!${docPath})`;
+                }
             }
             this.previousActiveHighlight = { range_cfi: targetCfi, point_cfi: openAt, text: "" };
         }

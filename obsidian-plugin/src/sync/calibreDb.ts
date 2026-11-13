@@ -9,7 +9,7 @@ import { buildPointCfi, buildRangeCfi } from "./epubCfi";
 
 let sqlJsPromise: Promise<SqlJsStatic> | null = null;
 
-async function getSqlJs(): Promise<SqlJsStatic> {
+export async function getSqlJs(): Promise<SqlJsStatic> {
 	if (!sqlJsPromise) {
 		const wasmBuffer = wasmBinary.buffer.slice(
 			wasmBinary.byteOffset,
@@ -235,6 +235,116 @@ export class CalibreDatabase {
 		}
 
 		return bestMatch;
+	}
+
+	getBookById(bookId: number): CalibreBook | null {
+		if (!Number.isFinite(bookId) || bookId <= 0) return null;
+		const stmt = this.db.prepare(`
+			SELECT b.id, b.title, b.path, b.author_sort, GROUP_CONCAT(d.format) as formats
+			FROM books b
+			LEFT JOIN data d ON b.id = d.book
+			WHERE b.id = ?
+			GROUP BY b.id
+		`);
+		stmt.bind([bookId]);
+		try {
+			if (!stmt.step()) return null;
+			const row = stmt.get();
+			const rawFormats = typeof row[4] === "string" ? row[4] : "";
+			const formats = rawFormats
+				.split(",")
+				.map((f) => f.trim().toUpperCase())
+				.filter(Boolean);
+			return {
+				bookId: Number(row[0]),
+				title: String(row[1] ?? ""),
+				path: String(row[2] ?? ""),
+				authors: String(row[3] ?? ""),
+				formats,
+			};
+		} finally {
+			stmt.free();
+		}
+	}
+
+	ensureEpubFormatRecord(bookId: number, epubPath: string): boolean {
+		try {
+			if (!epubPath || !fs.existsSync(epubPath)) return false;
+			const st = fs.statSync(epubPath);
+			if (!st.isFile() || st.size <= 0) return false;
+
+			const baseName = path.basename(epubPath, path.extname(epubPath));
+			const checkStmt = this.db.prepare(
+				"SELECT uncompressed_size, name FROM data WHERE book = ? AND UPPER(format) = 'EPUB'"
+			);
+			checkStmt.bind([bookId]);
+			let existingSize = -1;
+			let existingName = "";
+			const exists = checkStmt.step();
+			if (exists) {
+				const row = checkStmt.get();
+				existingSize = Number(row[0] ?? -1);
+				existingName = String(row[1] ?? "");
+			}
+			checkStmt.free();
+
+			if (exists && existingSize === st.size && existingName === baseName) {
+				return false;
+			}
+
+			const stmt = this.db.prepare(
+				"INSERT OR REPLACE INTO data (book, format, uncompressed_size, name) VALUES (?, 'EPUB', ?, ?)"
+			);
+			stmt.run([bookId, st.size, baseName]);
+			stmt.free();
+			this.dirty = true;
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	getBookHighlightTexts(bookId: number): Array<{ text: string; note?: string; color?: string }> {
+		if (!this.hasAnnotationsTables()) return [];
+		const stmt = this.db.prepare(
+			"SELECT format, annot_data FROM annotations WHERE book = ? AND annot_type = 'highlight'"
+		);
+		stmt.bind([bookId]);
+		const rows: Array<{ fmt: string; text: string; note?: string; color?: string }> = [];
+		try {
+			while (stmt.step()) {
+				const r = stmt.get();
+				const fmt = String(r[0] ?? "").toUpperCase();
+				try {
+					const data = JSON.parse(String(r[1] ?? "{}")) as {
+						highlighted_text?: unknown;
+						notes?: unknown;
+						style?: { which?: unknown };
+					};
+					const text = typeof data.highlighted_text === "string" ? data.highlighted_text.trim() : "";
+					if (!text) continue;
+					const note = typeof data.notes === "string" && data.notes.trim() ? data.notes.trim() : undefined;
+					const color = typeof data.style?.which === "string" ? data.style.which : undefined;
+					rows.push({ fmt, text, note, color });
+				} catch {
+					/* ignore malformed annotation payload */
+				}
+			}
+		} finally {
+			stmt.free();
+		}
+
+		// Prefer EPUB annotations first so any updated notes/colors take priority
+		rows.sort((a, b) => (a.fmt === "EPUB" ? -1 : 0) - (b.fmt === "EPUB" ? -1 : 0));
+		const seen = new Set<string>();
+		const unique: Array<{ text: string; note?: string; color?: string }> = [];
+		for (const item of rows) {
+			const norm = cleanMatchText(item.text);
+			if (!norm || seen.has(norm)) continue;
+			seen.add(norm);
+			unique.push({ text: item.text, note: item.note, color: item.color });
+		}
+		return unique;
 	}
 
 	injectAnnotation(

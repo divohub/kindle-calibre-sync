@@ -3,10 +3,17 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import type { Clipping, ClippingType } from "../types";
+import { readMtpKindleClippings } from "./mtpClient";
 
 export interface DetectedClippings {
 	path: string;
-	source: "usb" | "configured" | "fallback";
+	content?: string;
+	source: "usb" | "mtp" | "configured" | "fallback";
+}
+
+export interface ClippingsDetectionResult {
+	detected: DetectedClippings | null;
+	mtpWarning?: string;
 }
 
 /**
@@ -204,10 +211,7 @@ function getMountRoots(): string[] {
 	return mounts;
 }
 
-/**
- * Auto-detects My Clippings.txt on a connected Kindle USB drive, configured path, or standard fallbacks.
- */
-export function detectKindleClippingsPath(customFallback?: string, vaultBasePath?: string): DetectedClippings | null {
+function detectUsbMassStorageClippings(): DetectedClippings | null {
 	for (const mount of getMountRoots()) {
 		for (const rel of [path.join("documents", "My Clippings.txt"), "My Clippings.txt"]) {
 			const candidate = path.join(mount, rel);
@@ -220,7 +224,13 @@ export function detectKindleClippingsPath(customFallback?: string, vaultBasePath
 			}
 		}
 	}
+	return null;
+}
 
+function detectLocalFallbackClippings(
+	customFallback?: string,
+	vaultBasePath?: string
+): DetectedClippings | null {
 	if (customFallback && customFallback.trim()) {
 		const expanded = expandHome(customFallback);
 		try {
@@ -250,4 +260,45 @@ export function detectKindleClippingsPath(customFallback?: string, vaultBasePath
 	}
 
 	return null;
+}
+
+/**
+ * Synchronously checks mounted USB Mass Storage drives, configured path, and local fallbacks.
+ */
+export function detectKindleClippingsPath(customFallback?: string, vaultBasePath?: string): DetectedClippings | null {
+	return detectUsbMassStorageClippings() ?? detectLocalFallbackClippings(customFallback, vaultBasePath);
+}
+
+/**
+ * Auto-detects My Clippings.txt prioritizing live connected Kindle devices (USB Mass Storage, then MTP)
+ * before falling back to configured/local files.
+ */
+export async function detectKindleClippingsAsync(
+	customFallback?: string,
+	vaultBasePath?: string
+): Promise<ClippingsDetectionResult> {
+	const usb = detectUsbMassStorageClippings();
+	if (usb) {
+		return { detected: usb };
+	}
+
+	const mtp = await readMtpKindleClippings();
+	if (mtp.result) {
+		return {
+			detected: {
+				path: mtp.result.path,
+				content: mtp.result.content,
+				source: "mtp",
+			},
+		};
+	}
+
+	// If an MTP Kindle is connected right now but locked/busy, do not silently sync a stale local file.
+	if (mtp.warning) {
+		return { detected: null, mtpWarning: mtp.warning };
+	}
+
+	return {
+		detected: detectLocalFallbackClippings(customFallback, vaultBasePath),
+	};
 }

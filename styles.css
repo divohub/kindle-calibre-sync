@@ -113,3 +113,20 @@
     rx: 2px;
     ry: 2px;
 }
+
+.kindle-hidden-file-input {
+    display: none;
+}
+
+.kindle-modal-desc {
+    color: var(--text-muted);
+    margin-bottom: 14px;
+}
+
+.kindle-modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
+}
+
