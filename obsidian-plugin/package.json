@@ -1,6 +1,6 @@
 {
   "name": "kindle-calibre-sync",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "license": "MIT",
   "scripts": {
     "dev": "node build.mjs",
@@ -8,11 +8,14 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
+    "@xmldom/xmldom": "^0.8.15",
     "epubjs": "^0.3.93",
-    "jszip": "^3.10.1"
+    "jszip": "^3.10.1",
+    "sql.js-fts5": "^1.4.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/sql.js": "^1.4.11",
     "esbuild": "^0.25.0",
     "obsidian": "^1.14.4",
     "typescript": "^5.8.0"

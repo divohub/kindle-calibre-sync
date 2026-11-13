@@ -1,138 +1,75 @@
 # Kindle Calibre Sync
 
-Automatic bridge for syncing Kindle highlights and notes directly into Calibre and Obsidian.
+Plug-and-play bridge for syncing Kindle highlights and notes directly into Calibre and Obsidian, with a built-in side-by-side EPUB reader.
 
 ![Kindle Calibre Sync Demo](assets/demo.png)
 
-## Quick Start
+## Quick Start (Plug & Play)
 
-1. **Install the Obsidian plugin**:
-   - Open Obsidian **Settings** → **Community plugins** → **Browse**, search for **Kindle Calibre Sync**, install, and enable it.
-   - *(While community directory review is pending, you can also install via [BRAT](https://github.com/TfTHacker/obsidian42-brat) by adding `divohub/kindle-calibre-sync`.)*
-2. **Prepare Calibre & Python backend**:
-   - Make sure **Calibre** (with your books added) and **Python 3.9+** are installed.
-   - Clone this repository for the Python sync script and install dependencies:
-     ```bash
-     git clone https://github.com/divohub/kindle-calibre-sync.git
-     cd kindle-calibre-sync
-     pip install -r requirements.txt
-     ```
-3. **Configure paths**:
-   - Set your vault and Calibre paths in `config.json`.
-   - Open **Settings → Kindle Calibre Sync** in Obsidian and verify **Sync script path** (path to `kindle_sync.py`) and **Calibre library path**.
-4. **Sync & Read**:
-   - Plug in your Kindle via USB and click the book icon in the left ribbon (or run the command **Sync highlights with Calibre**).
-   - Click any `[location](calibre://...)` link in your generated book notes to open the EPUB side-by-side at the exact quote.
+No Python, terminal setup, or external scripts required.
+
+1. **Install & enable the plugin**:
+   - Open Obsidian **Settings → Community plugins → Browse**, search for **Kindle Calibre Sync**, install, and enable it.
+   - *(Or install via [BRAT](https://github.com/TfTHacker/obsidian42-brat) by adding `divohub/kindle-calibre-sync`.)*
+2. **Have Calibre ready**:
+   - Make sure **Calibre** is installed and your EPUB books are in your Calibre Library (usually `~/Calibre Library` — auto-detected from Calibre's config).
+3. **Sync & Read**:
+   - Plug in your Kindle via USB and click the book icon in Obsidian's left ribbon (or run **Sync highlights with Calibre**).
+   - If your Kindle isn't plugged in, Obsidian prompts you to pick a local `My Clippings.txt` file directly.
+   - Click any `[location](calibre://...)` link in your book notes to open the EPUB side-by-side at the exact quote.
 
 ---
 
-## Features
+## What Happens Automatically
 
-1. **Auto-detect Kindle via USB**:
-   - Scans mount points (`/run/media/$USER/*`, `/media/*`, `/Volumes/*`, Windows drives).
-   - Automatically locates `documents/My Clippings.txt`.
-   - In `--watch` mode, continuously listens for Kindle USB connections and syncs without manual intervention.
-2. **Native Calibre Injection**:
-   - Matches books in Calibre's `metadata.db` by title and author.
-   - Unpacks EPUB files and calculates exact fragment coordinates (`EPUB CFI`).
-   - Injects native highlights and user notes into Calibre's `annotations` table. When opening the book in Calibre Viewer, all highlights appear in yellow.
-3. **Obsidian Notes Generation & Deep-Linking**:
-   - Format 100% compatible with `obsidian-kindle-plugin` (frontmatter, `^ref-XXXXX`, stored in `30 - Source Material`).
-   - Converts empty location links `location: [482]()` into clickable deep-links `location: [482](calibre://view-book/...)`.
-   - Clicking a location number opens the embedded e-book reader directly in Obsidian alongside the note at the exact highlighted sentence.
-   - External Calibre Viewer remains available as an optional one-click button in the reader toolbar.
-   - Duplicate protection: existing notes are preserved and cleanly updated with only new quotes.
-4. **Automatic EPUB Conversion**:
-   - If a book in Calibre is only available in `.fb2` or `.azw3`, the bridge automatically converts it to `.epub` via `ebook-convert` and indexes all coordinates seamlessly.
+1. **Zero-Config Detection**:
+   - **Kindle USB**: Scans mount points across Linux (`/run/media`, `/media`, `/mnt`), macOS (`/Volumes`), and Windows (`D:`–`Z:`) for `documents/My Clippings.txt` (or opens a file picker modal if not attached).
+   - **Calibre Library**: Auto-detects your library folder from Calibre's `global.py.json` or default paths (`~/Calibre Library`, `~/Documents/Calibre Library`).
+   - **Highlights Folder**: Auto-detects an existing folder containing Kindle frontmatter (`kindle-title` / `kindle-bookId`) or creates `Kindle Highlights/` inside your vault.
+2. **Native Calibre SQLite Injection**:
+   - Matches books in Calibre's `metadata.db` by title and author (fuzzy matching).
+   - Unpacks EPUB chapters in memory and calculates exact **EPUB CFI** coordinates.
+   - Injects highlights and personal notes directly into Calibre's `annotations` and `annotations_dirtied` tables using bundled SQLite WASM (`sql.js-fts5`).
+3. **Obsidian Notes & Side-by-Side Reader**:
+   - Compatible with `obsidian-kindle-plugin` markdown format (frontmatter, `^ref-XXXXX`, `*Note*: ...`).
+   - Converts empty `[loc]()` links into deep-links `[loc](calibre://view-book/...)` and safely appends only new highlights without duplicates.
+   - Clicking any location number opens the embedded `ePub.js` reader beside your note, scrolls to the exact sentence, and highlights it in warm amber (with all other book highlights shown in soft yellow).
+   - Supports Light, Dark, and Sepia themes, font scaling (`A-` / `A+`), arrow-key navigation, and an optional **Open in Calibre** toolbar button.
+4. **On-Demand EPUB Conversion**:
+   - If a matched book in Calibre only has `.fb2`, `.azw3`, or `.mobi`, clicking its link converts it to `.epub` automatically via `ebook-convert` (if Calibre CLI tools are available).
 
 ---
 
-## System Requirements
+## Settings
 
-1. Ensure Python 3.9+ and Calibre are installed:
-```bash
-sudo pacman -S python calibre   # Arch Linux
-# or: sudo apt install python3 calibre  # Ubuntu/Debian
-```
+All paths are optional — leave them blank for automatic detection:
 
-2. Install Python dependencies (`lxml` for EPUB CFI parsing):
+- **Calibre library path**: Override path to the folder containing `metadata.db`.
+- **Highlights folder**: Vault folder where book notes are stored.
+- **Fallback clippings file path**: Optional local `My Clippings.txt` used when Kindle USB isn't connected.
+- **Inject highlights into Calibre**: Toggle writing annotations directly into Calibre's `metadata.db`.
+- **Open reader side-by-side**: Toggle intercepting `calibre://view-book/` links in the embedded EPUB reader vs forwarding to the OS handler.
+
+---
+
+## Optional: Standalone Python CLI (`--watch` daemon)
+
+For headless or automated background syncing without Obsidian open, the repository still includes the legacy Python CLI scripts (`kindle_sync.py`, `clippings_parser.py`, `calibre_adapter.py`, `obsidian_exporter.py`).
+
 ```bash
 pip install -r requirements.txt
-```
-
----
-
-## Configuration (`config.json`)
-
-The `config.json` file is created automatically with the following parameters:
-
-```json
-{
-  "vault_path": "/home/divo/Documents/obsidiane-private",
-  "highlights_folder": "30 - Source Material",
-  "calibre_library_path": "/home/divo/Calibre Library",
-  "calibre_library_id": "Calibre_Library",
-  "kindle_mount_patterns": [
-    "/run/media/*/*",
-    "/media/*/*",
-    "/Volumes/*"
-  ],
-  "clippings_file_relpath": "documents/My Clippings.txt",
-  "clippings_fallback_path": "/home/divo/My Clippings.txt",
-  "inject_calibre_annotations": true
-}
-```
-
----
-
-## Usage
-
-### 1. One-time Sync (with USB auto-detect / fallback file)
-```bash
-python3 kindle_sync.py
-```
-
-### 2. Dry-run Mode (simulation without database/file writes)
-```bash
-python3 kindle_sync.py --dry-run
-```
-
-### 3. Sync a Specific Book
-```bash
-python3 kindle_sync.py --book "Ubik"
-```
-
-### 4. Background Watcher Mode (Daemon)
-Polls for Kindle USB connection every 5 seconds and triggers sync automatically:
-```bash
 python3 kindle_sync.py --watch
 ```
 
----
+Example `config.json` (used only by the Python CLI):
 
-## Project Structure
-
-- `kindle_sync.py` — Main orchestrator and CLI.
-- `clippings_parser.py` — Parser for `My Clippings.txt` (supports RU and EN locales, merges user notes with highlights).
-- `calibre_adapter.py` — Calibre book matcher, EPUB CFI calculator, SQLite annotations injector, deep-link builder.
-- `obsidian_exporter.py` — Markdown note generator/updater matching `obsidian-kindle-plugin` format.
-- `config.json` — Paths and settings.
-- `obsidian-plugin/` — Source code for the native Obsidian plugin.
-
----
-
-## Native Obsidian Plugin (`kindle-calibre-sync`)
-
-The plugin is located in `obsidian-plugin/` and installed to `.obsidian/plugins/kindle-calibre-sync/`.
-
-1. **Enable Plugin**:
-   - Open Obsidian **Settings** $\rightarrow$ **Community plugins** $\rightarrow$ click **Reload plugins**.
-   - Enable **Kindle Calibre Sync & Reader**.
-2. **Ribbon Sync Button**:
-   - A `book-open` icon is available on the left ribbon. Clicking it triggers sync with status notices.
-3. **Embedded Side-by-Side Reader**:
-   - Clicking any `[location](calibre://...)` link opens a side pane with the built-in EPUB reader (`ePub.js`).
-   - Automatically navigates to the exact quote and highlights it in warm amber.
-   - All quotes throughout the book are highlighted in soft yellow.
-   - Supports light, dark, and sepia themes, font size scaling (`A-` / `A+`), and keyboard arrow navigation.
-   - Click the external link icon in the reader toolbar to open Calibre Viewer if needed.
+```json
+{
+  "vault_path": "/path/to/your/ObsidianVault",
+  "highlights_folder": "Kindle Highlights",
+  "calibre_library_path": "~/Calibre Library",
+  "calibre_library_id": "Calibre_Library",
+  "clippings_file_relpath": "documents/My Clippings.txt",
+  "inject_calibre_annotations": true
+}
+```

@@ -3,20 +3,9 @@ import ePub, { Book, Rendition } from "epubjs";
 import * as fs from "fs";
 import * as path from "path";
 import { spawn } from "child_process";
+import type { BooksIndexRecord, HighlightEntry } from "./types";
 
 export const VIEW_TYPE_KINDLE_EPUB = "kindle-epub-reader-view";
-
-interface HighlightEntry {
-    range_cfi?: string;
-    point_cfi?: string;
-    start_cfi?: string;
-    spine_index?: number;
-    text?: string;
-}
-
-interface BooksIndexRecord {
-    highlights?: HighlightEntry[];
-}
 
 interface EpubQueue {
     dequeue: () => unknown;
@@ -310,7 +299,13 @@ export class KindleEpubView extends ItemView {
         }
     }
 
-    async loadBook(epubPath: string, openAt?: string, bookId?: string, scriptPath?: string): Promise<void> {
+    async loadBook(
+        epubPath: string,
+        openAt?: string,
+        bookId?: string,
+        scriptPath?: string,
+        preloadedHighlights?: HighlightEntry[]
+    ): Promise<void> {
         if (!fs.existsSync(epubPath)) {
             this.titleSpan.setText("Book file not found");
             return;
@@ -319,8 +314,10 @@ export class KindleEpubView extends ItemView {
         this.currentBookId = bookId || "";
         this.scriptPath = scriptPath || "";
 
-        // If same book already loaded, just navigate
+        // If same book already loaded, update highlights if provided and navigate
         if (this.currentEpubPath === epubPath && this.rendition) {
+            this.loadHighlights(this.currentBookId, preloadedHighlights);
+            this.renderHighlightsForActiveViews();
             if (openAt) {
                 await this.navigateTo(openAt);
             }
@@ -332,7 +329,7 @@ export class KindleEpubView extends ItemView {
         this.destroyCurrentBook();
         this.viewerEl.empty();
 
-        this.loadHighlights(this.currentBookId);
+        this.loadHighlights(this.currentBookId, preloadedHighlights);
 
         const buffer = fs.readFileSync(epubPath);
         const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
@@ -393,11 +390,25 @@ export class KindleEpubView extends ItemView {
         }
     }
 
-    private loadHighlights(bookId: string): void {
+    updateBookHighlights(bookId: string, highlights: HighlightEntry[]): void {
+        if (this.currentBookId && this.currentBookId === bookId) {
+            this.currentHighlights = highlights;
+            this.renderHighlightsForActiveViews();
+        }
+    }
+
+    private loadHighlights(bookId: string, preloadedHighlights?: HighlightEntry[]): void {
         this.currentHighlights = [];
         if (!bookId) return;
 
-        const syncDir = this.scriptPath ? path.dirname(this.scriptPath) : "/home/divo/Work/kindle-calibre-sync";
+        if (preloadedHighlights !== undefined) {
+            this.currentHighlights = preloadedHighlights;
+            return;
+        }
+
+        if (!this.scriptPath) return;
+
+        const syncDir = path.dirname(this.scriptPath);
         const indexPath = path.join(syncDir, "books_index.json");
 
         if (fs.existsSync(indexPath)) {

@@ -29,7 +29,11 @@ await build({
 		"@lezer/highlight",
 		"@lezer/lr",
 		...builtinModules,
+		...builtinModules.map((name) => `node:${name}`),
 	],
+	loader: {
+		".wasm": "binary",
+	},
 	plugins: [epubWithoutScripts],
 	alias: {
 		"jszip/dist/jszip": resolve(__dirname, "node_modules/jszip/lib/index.js"),
