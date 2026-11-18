@@ -6,6 +6,7 @@ import initSqlJs, { type Database, type SqlJsStatic } from "sql.js-fts5";
 import wasmBinary from "sql.js-fts5/dist/sql-wasm.wasm";
 import type { BooksIndex, CalibreBook, CfiInfo, HighlightEntry } from "../types";
 import { buildPointCfi, buildRangeCfi } from "./epubCfi";
+import { cleanMatchText } from "./textUtils";
 
 let sqlJsPromise: Promise<SqlJsStatic> | null = null;
 
@@ -95,10 +96,6 @@ export function detectCalibreLibraryPath(configuredPath?: string): string | null
 	}
 
 	return null;
-}
-
-function cleanMatchText(text: string): string {
-	return text.toLowerCase().replace(/[^\p{L}\p{N}_\s]/gu, "").trim();
 }
 
 export function cleanTextForSearch(text: string): string {

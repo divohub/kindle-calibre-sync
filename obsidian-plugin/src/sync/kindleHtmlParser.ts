@@ -2,7 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Clipping, ClippingType } from "../types";
-import { collapseAndAttachClippings, computeRefId } from "./clippingsParser";
+import { mergeBookClippingsMaps } from "./bookMerge";
+import { appendOrMergeNoteText, computeRefId } from "./textUtils";
 
 const HTML_ENTITY_MAP: Record<string, string> = {
 	amp: "&",
@@ -18,6 +19,13 @@ const HTML_ENTITY_MAP: Record<string, string> = {
 	hellip: "…",
 	middot: "·",
 };
+
+const MAX_SCANNED_HTML_FILES = 250;
+const NOTE_HEADING_RE = /(?:^|[^\p{L}\p{N}_])(?:note|notes|заметка|заметки|notiz|remarque|nota)(?=$|[^\p{L}\p{N}_])/iu;
+const BOOKMARK_HEADING_RE = /(?:^|[^\p{L}\p{N}_])(?:bookmark|bookmarks|закладка|закладки|lesezeichen|signet|marcador)(?=$|[^\p{L}\p{N}_])/iu;
+const PAGE_HEADING_RE = /(?:^|[^\p{L}\p{N}_])(?:(?:pages?|страниц[аы]|стр|seiten?|páginas?)\s+|(?:стр\.|p\.)\s*)([\d,]+)/iu;
+const LOC_HEADING_RE = /(?:^|[^\p{L}\p{N}_])(?:locations?|позици[яи]|место(?:положение)?|локаци[яи]|position(?:en)?|emplacement|posici[oó]n|loc\.?)\s*([\d,]+)(?:\s*[-–—]\s*([\d,]+))?/iu;
+const NEXT_KINDLE_TOKEN_RE = /<[a-zA-Z0-9]+\b[^>]*\bclass\s*=\s*["'][^"']*\b(?:bookTitle|authors?|sectionHeading|noteHeading|noteText)\b[^>]*>|<\/\s*body\b/i;
 
 function decodeHtmlEntities(input: string): string {
 	return input.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (full, code: string) => {
@@ -92,6 +100,12 @@ function findMatchingTagClose(html: string, tagName: string, contentStart: numbe
 	return -1;
 }
 
+function findUnclosedTokenFallbackEnd(html: string, contentStart: number): number {
+	const rest = html.slice(contentStart);
+	const m = NEXT_KINDLE_TOKEN_RE.exec(rest);
+	return m ? contentStart + m.index : html.length;
+}
+
 function extractKindleHtmlTokens(html: string): KindleHtmlToken[] {
 	const tokens: KindleHtmlToken[] = [];
 	const openRe = /<([a-zA-Z0-9]+)\b[^>]*\bclass\s*=\s*["']([^"']*)["'][^>]*>/gi;
@@ -109,15 +123,14 @@ function extractKindleHtmlTokens(html: string): KindleHtmlToken[] {
 		if (!kind) continue;
 
 		const contentStart = openRe.lastIndex;
-		const closeIdx = findMatchingTagClose(html, tagName, contentStart);
-		if (closeIdx < 0) continue;
+		const matchedClose = findMatchingTagClose(html, tagName, contentStart);
+		const sliceEnd = matchedClose >= 0 ? matchedClose : findUnclosedTokenFallbackEnd(html, contentStart);
 
-		const text = htmlSliceToPlainText(html.slice(contentStart, closeIdx));
+		const text = htmlSliceToPlainText(html.slice(contentStart, sliceEnd));
 		if (text) {
 			tokens.push({ kind, text });
 		}
-		// Advance regex past inner nested elements of noteHeading/noteText so inner spans don't re-match
-		openRe.lastIndex = closeIdx;
+		openRe.lastIndex = sliceEnd;
 	}
 
 	return tokens;
@@ -133,30 +146,32 @@ function parseIntWithCommas(raw: string | undefined): number {
 	return Number.isFinite(num) ? num : 0;
 }
 
-function parseKindleHtmlHeading(heading: string): {
+interface ParsedHtmlHeading {
 	entryType: ClippingType;
 	page: number | null;
 	locationStart: number;
 	locationEnd: number;
-} {
+	hasExplicitLocation: boolean;
+}
+
+function parseKindleHtmlHeading(heading: string): ParsedHtmlHeading {
 	const prefix = (heading.split(/\s*[-–—]\s*/)[0] || heading).toLowerCase();
 	let entryType: ClippingType = "highlight";
-	if (/\b(?:note|заметка|notiz|remarque|nota)\b/i.test(prefix)) {
+	if (NOTE_HEADING_RE.test(prefix)) {
 		entryType = "note";
-	} else if (/\b(?:bookmark|закладка|lesezeichen|signet|marcador)\b/i.test(prefix)) {
+	} else if (BOOKMARK_HEADING_RE.test(prefix)) {
 		entryType = "bookmark";
 	}
 
-	const pageMatch = heading.match(/(?:Page|Страница|стр\.?|Seite|Página|p\.)\s+([\d,]+)/i);
+	const pageMatch = heading.match(PAGE_HEADING_RE);
 	const page = pageMatch ? parseIntWithCommas(pageMatch[1]) : null;
 
-	const locMatch = heading.match(
-		/(?:Location|Место|Локация|Position|Emplacement|Posición|Loc\.?)\s+([\d,]+)(?:\s*[-–]\s*([\d,]+))?/i
-	);
+	const locMatch = heading.match(LOC_HEADING_RE);
+	const hasExplicitLocation = Boolean(locMatch);
 	let locationStart = locMatch ? parseIntWithCommas(locMatch[1]) : 0;
 	let locationEnd = locMatch && locMatch[2] ? parseIntWithCommas(locMatch[2]) : locationStart;
 
-	if (locationStart === 0 && page && page > 0) {
+	if (!hasExplicitLocation && page && page > 0) {
 		locationStart = page;
 		locationEnd = page;
 	}
@@ -166,7 +181,29 @@ function parseKindleHtmlHeading(heading: string): {
 		page,
 		locationStart,
 		locationEnd: Math.max(locationStart, locationEnd),
+		hasExplicitLocation,
 	};
+}
+
+function isHtmlNoteAttachedToHighlight(
+	noteMeta: ParsedHtmlHeading,
+	lastHl: { clip: Clipping; hasExplicitLocation: boolean } | undefined
+): boolean {
+	if (!lastHl) return false;
+
+	if (noteMeta.hasExplicitLocation && lastHl.hasExplicitLocation) {
+		return (
+			noteMeta.locationStart >= lastHl.clip.locationStart - 5 &&
+			noteMeta.locationStart <= lastHl.clip.locationEnd + 5
+		);
+	}
+	if (!noteMeta.hasExplicitLocation && !lastHl.hasExplicitLocation) {
+		if (noteMeta.page !== null) {
+			return lastHl.clip.page === noteMeta.page;
+		}
+		return lastHl.clip.page === null;
+	}
+	return noteMeta.page !== null && lastHl.clip.page !== null && noteMeta.page === lastHl.clip.page;
 }
 
 /**
@@ -184,6 +221,7 @@ export function isKindleHtmlExport(content: string): boolean {
 
 /**
  * Parses an exported Kindle Desktop/Mobile Notebook HTML file into per-book Clippings.
+ * Attaches notes directly to their preceding highlight in document order without draft-collapse heuristics.
  */
 export function parseKindleHtmlContent(content: string, fallbackFilename = ""): Map<string, Clipping[]> {
 	const books = new Map<string, Clipping[]>();
@@ -214,16 +252,28 @@ export function parseKindleHtmlContent(content: string, fallbackFilename = ""): 
 		title = "Unknown Kindle Book";
 	}
 
-	let pendingHeading: ReturnType<typeof parseKindleHtmlHeading> | null = null;
+	let seenBookTitleToken = false;
+	let pendingHeading: ParsedHtmlHeading | null = null;
+	const lastHighlightByBook = new Map<string, { clip: Clipping; hasExplicitLocation: boolean }>();
 
 	for (const tok of tokens) {
 		if (tok.kind === "title") {
+			if (seenBookTitleToken && tok.text !== title) {
+				author = "";
+			}
 			title = tok.text;
+			seenBookTitleToken = true;
 			pendingHeading = null;
 			continue;
 		}
 		if (tok.kind === "author") {
 			author = cleanAuthorValue(tok.text);
+			const currentList = books.get(title);
+			if (currentList) {
+				for (const item of currentList) {
+					if (!item.author) item.author = author;
+				}
+			}
 			continue;
 		}
 		if (tok.kind === "heading") {
@@ -240,6 +290,22 @@ export function parseKindleHtmlContent(content: string, fallbackFilename = ""): 
 			const text = tok.text.trim();
 			if (!text) continue;
 
+			let bookClips = books.get(title);
+			if (!bookClips) {
+				bookClips = [];
+				books.set(title, bookClips);
+			}
+
+			if (meta.entryType === "note") {
+				const lastHl = lastHighlightByBook.get(title);
+				if (lastHl && isHtmlNoteAttachedToHighlight(meta, lastHl)) {
+					lastHl.clip.note = appendOrMergeNoteText(lastHl.clip.note, text, {
+						replaceIncremental: false,
+					});
+					continue;
+				}
+			}
+
 			const clip: Clipping = {
 				title,
 				author,
@@ -251,24 +317,21 @@ export function parseKindleHtmlContent(content: string, fallbackFilename = ""): 
 				text,
 				refId: computeRefId(title, meta.locationStart, text),
 			};
+			bookClips.push(clip);
 
-			const existing = books.get(title);
-			if (existing) existing.push(clip);
-			else books.set(title, [clip]);
+			if (meta.entryType === "highlight") {
+				lastHighlightByBook.set(title, { clip, hasExplicitLocation: meta.hasExplicitLocation });
+			}
 		}
 	}
 
-	const result = new Map<string, Clipping[]>();
-	for (const [bookTitle, clist] of books.entries()) {
-		result.set(bookTitle, collapseAndAttachClippings(clist));
-	}
-	return result;
+	return books;
 }
 
 export function parseKindleHtmlSources(
 	sources: Array<{ path: string; content?: string }>
 ): Map<string, Clipping[]> {
-	const merged = new Map<string, Clipping[]>();
+	let merged = new Map<string, Clipping[]>();
 	for (const src of sources) {
 		let html = src.content;
 		if (typeof html !== "string" && src.path && fs.existsSync(src.path)) {
@@ -280,15 +343,7 @@ export function parseKindleHtmlSources(
 		}
 		if (!html) continue;
 		const parsed = parseKindleHtmlContent(html, src.path);
-		for (const [bookTitle, clist] of parsed.entries()) {
-			const existing = merged.get(bookTitle);
-			if (existing) {
-				existing.push(...clist);
-				merged.set(bookTitle, collapseAndAttachClippings(existing));
-			} else {
-				merged.set(bookTitle, clist);
-			}
-		}
+		merged = mergeBookClippingsMaps(merged, parsed);
 	}
 	return merged;
 }
@@ -312,8 +367,11 @@ export function detectKindleHtmlExports(
 ): Array<{ path: string; content: string }> {
 	const results: Array<{ path: string; content: string }> = [];
 	const seenFiles = new Set<string>();
+	let scannedCount = 0;
 
 	const tryReadHtmlFile = (filePath: string): void => {
+		if (scannedCount >= MAX_SCANNED_HTML_FILES) return;
+		scannedCount++;
 		try {
 			const real = fs.realpathSync(filePath);
 			if (seenFiles.has(real)) return;
@@ -330,7 +388,7 @@ export function detectKindleHtmlExports(
 	};
 
 	const scanDir = (dirPath: string, depth: number): void => {
-		if (depth > 2) return;
+		if (depth > 2 || scannedCount >= MAX_SCANNED_HTML_FILES) return;
 		let entries: fs.Dirent[];
 		try {
 			entries = fs.readdirSync(dirPath, { withFileTypes: true });
@@ -338,6 +396,8 @@ export function detectKindleHtmlExports(
 			return;
 		}
 		for (const ent of entries) {
+			if (scannedCount >= MAX_SCANNED_HTML_FILES) break;
+			if (ent.name.startsWith(".") || ent.name === "node_modules") continue;
 			const full = path.join(dirPath, ent.name);
 			if (ent.isDirectory()) {
 				scanDir(full, depth + 1);

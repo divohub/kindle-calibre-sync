@@ -16,6 +16,7 @@ import {
 	WorkspaceLeaf,
 } from "obsidian";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { detectCalibreLibraryPath } from "./sync/calibreDb";
 import { isKindleHtmlExport } from "./sync/kindleHtmlParser";
@@ -24,7 +25,7 @@ import {
 	detectSyncSourcesAsync,
 	saveKsdkDbCache,
 	type DetectedSyncSources,
-} from "./sync/ksdkDbReader";
+} from "./sync/sourceDetector";
 import { resolveHighlightsFolder } from "./sync/obsidianExporter";
 import {
 	buildBooksIndexFromCalibre,
@@ -120,7 +121,19 @@ async function readPickedSyncFiles(files: FileList, vaultBasePath?: string): Pro
 
 	let rememberHtmlPath: string | undefined;
 	if (htmlSources.length > 1 && htmlFsDirs.size === 1) {
-		rememberHtmlPath = Array.from(htmlFsDirs)[0];
+		const candidateDir = path.resolve(Array.from(htmlFsDirs)[0]);
+		const home = os.homedir();
+		const genericDirs = new Set([
+			path.resolve(home),
+			path.resolve(path.join(home, "Downloads")),
+			path.resolve(path.join(home, "Desktop")),
+			path.resolve(path.join(home, "Documents")),
+			path.resolve(os.tmpdir()),
+			path.parse(candidateDir).root,
+		]);
+		if (!genericDirs.has(candidateDir)) {
+			rememberHtmlPath = candidateDir;
+		}
 	} else if (htmlSources.length === 1 && singleHtmlFsPath) {
 		rememberHtmlPath = singleHtmlFsPath;
 	}

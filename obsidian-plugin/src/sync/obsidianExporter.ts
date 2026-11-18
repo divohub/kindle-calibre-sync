@@ -1,7 +1,12 @@
 import * as crypto from "crypto";
 import { App, normalizePath, TFile } from "obsidian";
 import type { Clipping } from "../types";
-import { isIncrementalTextEdit } from "./clippingsParser";
+import {
+	cleanMatchText,
+	commonPrefixLength,
+	isIncrementalTextEdit,
+	normalizeEditCompareText,
+} from "./textUtils";
 
 export const DEFAULT_HIGHLIGHTS_FOLDER = "Kindle Highlights";
 
@@ -17,10 +22,6 @@ export function getNoteFilename(title: string, author: string): string {
 		return `${sanitizeFilename(surname)}-${cleanTitle}.md`;
 	}
 	return `${cleanTitle}.md`;
-}
-
-function cleanMatchText(text: string): string {
-	return text.toLowerCase().replace(/[^\p{L}\p{N}_\s]/gu, "").trim();
 }
 
 function deterministicFallbackBookId(title: string): string {
@@ -68,17 +69,37 @@ function looksLikeRepeatedEditHistory(oldNote: string, latestNote: string): bool
 		.map((l) => l.trim())
 		.filter((l) => l.length > 0);
 	if (lines.length < 2) return false;
-	const latestNorm = latestNote.trim().toLowerCase().replace(/\s+/g, " ");
-	const lastNorm = lines[lines.length - 1].toLowerCase().replace(/\s+/g, " ");
+
+	const latestNorm = normalizeEditCompareText(latestNote);
+	const lastNorm = normalizeEditCompareText(lines[lines.length - 1]);
+	if (!latestNorm || !lastNorm) return false;
+
 	let editPairs = 0;
 	for (let i = 0; i < lines.length - 1; i++) {
 		if (isIncrementalTextEdit(lines[i], lines[i + 1])) {
 			editPairs++;
 		}
 	}
-	if (editPairs > 0 && lastNorm === latestNorm) return true;
-	if (editPairs === lines.length - 1) return true;
-	return lines.every((l) => isIncrementalTextEdit(l, latestNote));
+
+	if (editPairs > 0 && lastNorm === latestNorm) {
+		return true;
+	}
+	if (editPairs === lines.length - 1) {
+		if (latestNorm.startsWith(lastNorm)) {
+			return true;
+		}
+		if (
+			lastNorm.length >= 6 &&
+			latestNorm.length >= lastNorm.length &&
+			commonPrefixLength(lastNorm, latestNorm) >= Math.ceil(lastNorm.length * 0.65)
+		) {
+			return true;
+		}
+	}
+	return lines.every((l) => {
+		const lNorm = normalizeEditCompareText(l);
+		return lNorm === latestNorm || latestNorm.startsWith(lNorm);
+	});
 }
 
 export class VaultExporter {
@@ -283,12 +304,16 @@ export class VaultExporter {
 		);
 
 		content = content.replace(
-			/(\[(\d+)\]\([^)]*\)\s*\^ref-(\w+))[ \t]*((?:\r?\n[ \t]*)+\*Note\*:[ \t]*([\s\S]*?))?(?=(?:\r?\n[ \t]*)+---(?:\r?\n|$)|(?:\r?\n[ \t]*)+[^\n]*\^ref-\w+|\s*$)/g,
+			/(\[(\d+)\]\([^)]*\)\s*\^ref-(\w+))[ \t]*((?:\r?\n[ \t]*)+\*Note\*:[ \t]*([\s\S]*?))?(?=(?:\r?\n[ \t]*)+---[ \t]*(?:\r?\n|$)|(?:\r?\n[ \t]*)+#{1,6}\s+|(?:\r?\n[ \t]*)+[^\n]*\^ref-\w+|\s*$)/g,
 			(fullMatch, anchorPart: string, loc: string, refId: string, _noteSection?: string, existingNote?: string) => {
 				let matchedClip = clipByRefId.get(refId);
 				if (!matchedClip) {
 					const locCandidates = clipsByLoc.get(loc);
-					if (locCandidates && locCandidates.length === 1) {
+					if (
+						locCandidates &&
+						locCandidates.length === 1 &&
+						!existingRefs.has(locCandidates[0].refId)
+					) {
 						matchedClip = locCandidates[0];
 					}
 				}
@@ -303,8 +328,8 @@ export class VaultExporter {
 				}
 
 				const prevNote = existingNote.trim();
-				const prevNorm = prevNote.toLowerCase().replace(/\s+/g, " ");
-				const latestNorm = latestNote.toLowerCase().replace(/\s+/g, " ");
+				const prevNorm = normalizeEditCompareText(prevNote);
+				const latestNorm = normalizeEditCompareText(latestNote);
 				if (
 					prevNorm !== latestNorm &&
 					(looksLikeRepeatedEditHistory(prevNote, latestNote) || latestNorm.startsWith(prevNorm))
@@ -321,7 +346,11 @@ export class VaultExporter {
 		for (const clip of clippings) {
 			if (!existingRefs.has(clip.refId)) {
 				const cleanSnippet = clip.text.slice(0, 40);
-				if (cleanSnippet && !content.includes(cleanSnippet)) {
+				const alreadyInContent =
+					cleanSnippet.length >= 20
+						? content.includes(cleanSnippet)
+						: content.includes(`${clip.text} — location:`);
+				if (clip.text && !alreadyInContent) {
 					const link = calibreLinks.get(clip.refId) || "";
 					newBlocks.push(this.renderHighlightBlock(clip, link));
 					updatedCount++;

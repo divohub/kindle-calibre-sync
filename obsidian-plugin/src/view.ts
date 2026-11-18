@@ -4,15 +4,12 @@ import * as fs from "fs";
 import * as path from "path";
 import { spawn } from "child_process";
 import { buildEpubTextIndex, findCfiInIndex, type EpubTextIndex } from "./sync/epubCfi";
+import { normalizeAlnumKey } from "./sync/textUtils";
 import type { BooksIndexRecord, HighlightEntry } from "./types";
 
 export const VIEW_TYPE_KINDLE_EPUB = "kindle-epub-reader-view";
 
 const epubSearchIndexCache = new Map<string, EpubTextIndex>();
-
-function normalizeSearchQuery(text: string): string {
-    return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
-}
 
 async function getOrBuildEpubSearchIndex(epubPath: string): Promise<EpubTextIndex | null> {
     if (!epubPath || !fs.existsSync(epubPath)) return null;
@@ -696,13 +693,13 @@ export class KindleEpubView extends ItemView {
 
         if (openAt.startsWith("search:")) {
             const query = openAt.slice(7).trim();
-            const qNorm = normalizeSearchQuery(query);
+            const qNorm = normalizeAlnumKey(query);
             let resolvedCfi = "";
 
             // 1. Try matching already-loaded highlights first (preserves orange active highlight box)
             if (qNorm && this.currentHighlights.length > 0) {
                 for (const h of this.currentHighlights) {
-                    const hNorm = normalizeSearchQuery(h.text || "");
+                    const hNorm = normalizeAlnumKey(h.text || "");
                     if (!hNorm) continue;
                     const minMatch = Math.min(qNorm.length, hNorm.length) >= 12;
                     if (

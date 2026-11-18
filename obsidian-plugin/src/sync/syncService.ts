@@ -10,6 +10,7 @@ import type {
 	KindleCalibreSettings,
 	SyncSummary,
 } from "../types";
+import { mergeBookClippingsMaps } from "./bookMerge";
 import { CalibreDatabase, detectCalibreLibraryPath } from "./calibreDb";
 import { parseClippingsContent, parseClippingsFile } from "./clippingsParser";
 import {
@@ -26,12 +27,9 @@ import {
 	findExistingEpubInDir,
 } from "./epubConverter";
 import { parseKindleHtmlSources } from "./kindleHtmlParser";
-import {
-	loadCalibreAuthorMap,
-	mergeClippingsAndKsdkBooks,
-	parseKsdkAnnotationsDb,
-} from "./ksdkDbReader";
+import { loadCalibreAuthorMap, parseKsdkAnnotationsDb } from "./ksdkDbReader";
 import { resolveHighlightsFolder, VaultExporter } from "./obsidianExporter";
+import { normalizeAlnumKey } from "./textUtils";
 
 export interface SyncRunOptions {
 	app: App;
@@ -126,7 +124,7 @@ export async function runNativeSync(options: SyncRunOptions): Promise<SyncRunRes
 			kfxSearchDirs,
 			calibreAuthorByTitle,
 		});
-		booksClippings = mergeClippingsAndKsdkBooks(booksClippings, ksdkResult.books);
+		booksClippings = mergeBookClippingsMaps(booksClippings, ksdkResult.books);
 		if (ksdkResult.stats.unresolvedAsins.length > 0) {
 			onProgress?.(
 				`Note: ${ksdkResult.stats.unresolvedAsins.length} KFX book(s) in Kindle DB had no local .kfx match in Calibre Library.`
@@ -137,7 +135,7 @@ export async function runNativeSync(options: SyncRunOptions): Promise<SyncRunRes
 	if (htmlSources.length > 0) {
 		onProgress?.(`Parsing ${htmlSources.length} Kindle HTML export(s)...`);
 		const htmlBooks = parseKindleHtmlSources(htmlSources);
-		booksClippings = mergeClippingsAndKsdkBooks(booksClippings, htmlBooks);
+		booksClippings = mergeBookClippingsMaps(booksClippings, htmlBooks);
 	}
 
 	let totalClips = 0;
@@ -315,7 +313,7 @@ export async function runNativeSync(options: SyncRunOptions): Promise<SyncRunRes
 
 		return {
 			summary: {
-				clippingsPath: clippingsSource?.path || ksdkDb?.path || "",
+				clippingsPath: clippingsSource?.path || ksdkDb?.path || htmlSources[0]?.path || "",
 				totalBooks: booksClippings.size,
 				totalClips,
 				matchedBooks,
@@ -342,10 +340,6 @@ interface ParsedMarkdownHighlight {
 	note?: string;
 }
 
-function normalizeTextKey(text: string): string {
-	return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
-}
-
 function extractHighlightsFromMarkdown(content: string): ParsedMarkdownHighlight[] {
 	const results: ParsedMarkdownHighlight[] = [];
 	const highlightsIdx = content.search(/^##\s+Highlights\b/m);
@@ -360,7 +354,8 @@ function extractHighlightsFromMarkdown(content: string): ParsedMarkdownHighlight
 		const refId = m[2];
 		const afterMatch = block.slice((m.index ?? 0) + m[0].length);
 		const noteMatch = afterMatch.match(/\*Note\*:\s*([\s\S]+)$/);
-		const note = noteMatch ? noteMatch[1].trim() : undefined;
+		const bareAfter = afterMatch.trim();
+		const note = noteMatch ? noteMatch[1].trim() : (bareAfter || undefined);
 		results.push({ text: rawText, refId, note });
 	}
 
@@ -377,11 +372,11 @@ function findNoteFileByBookId(app: App, bookId: string, titleHint?: string): TFi
 		}
 	}
 	if (titleHint) {
-		const normTitle = normalizeTextKey(titleHint);
+		const normTitle = normalizeAlnumKey(titleHint);
 		for (const file of files) {
 			const fm = app.metadataCache.getFileCache(file)?.frontmatter;
 			const fmTitle = typeof fm?.["kindle-title"] === "string" ? fm["kindle-title"] : "";
-			if (fmTitle && normalizeTextKey(fmTitle) === normTitle) {
+			if (fmTitle && normalizeAlnumKey(fmTitle) === normTitle) {
 				return file;
 			}
 		}
@@ -492,14 +487,14 @@ export async function prepareBookEpubForViewer(
 		}
 		const mergedByNorm = new Map<string, MergedItem>();
 		for (const item of dbHighlights) {
-			const key = normalizeTextKey(item.text);
+			const key = normalizeAlnumKey(item.text);
 			if (!key) continue;
 			if (!mergedByNorm.has(key)) {
 				mergedByNorm.set(key, { text: item.text, note: item.note, color: item.color, refIds: [] });
 			}
 		}
 		for (const item of noteHighlights) {
-			const key = normalizeTextKey(item.text);
+			const key = normalizeAlnumKey(item.text);
 			if (!key) continue;
 			const existing = mergedByNorm.get(key);
 			if (existing) {
@@ -521,7 +516,7 @@ export async function prepareBookEpubForViewer(
 		const epubIndex = await buildEpubTextIndex(epubPath);
 		const highlights: HighlightEntry[] = [];
 		const linkByRefId = new Map<string, string>();
-		const normSearchTarget = openAt.startsWith("search:") ? normalizeTextKey(openAt.slice(7)) : "";
+		const normSearchTarget = openAt.startsWith("search:") ? normalizeAlnumKey(openAt.slice(7)) : "";
 		let resolvedOpenAt: string | undefined;
 
 		for (const [normKey, item] of mergedByNorm.entries()) {

@@ -1,9 +1,8 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { Clipping } from "../types";
+import { mergeBookClippingsMaps } from "./bookMerge";
 import { CalibreDatabase, getSqlJs } from "./calibreDb";
-import { computeRefId, isIncrementalTextEdit } from "./clippingsParser";
 import {
 	extractKfxTextRange,
 	kfxPidToLocation,
@@ -12,10 +11,38 @@ import {
 	type KfxMetadata,
 	type KfxParsedBook,
 } from "./kfxReader";
-import { detectKindleHtmlExports } from "./kindleHtmlParser";
-import { readMtpKindleSources } from "./mtpClient";
+import {
+	describeDetectedSyncSources,
+	detectSyncSourcesAsync,
+	findLocalKsdkDbPath,
+	getKsdkCacheFilePath,
+	saveKsdkDbCache,
+	type DetectSyncSourcesOptions,
+	type DetectedSyncSources,
+	type SyncSourceKind,
+} from "./sourceDetector";
+import {
+	appendOrMergeNoteText,
+	computeRefId,
+	isIncrementalTextEdit,
+	normalizeAlnumKey,
+	normalizeEditCompareText,
+	normalizeHighlightDedupKey,
+} from "./textUtils";
 
-const KSDK_CACHE_FILENAME = "ksdk_annotation_v1.cache.db";
+export {
+	normalizeAlnumKey as cleanBookTitleKey,
+	normalizeHighlightDedupKey,
+	mergeBookClippingsMaps as mergeClippingsAndKsdkBooks,
+	describeDetectedSyncSources,
+	detectSyncSourcesAsync,
+	findLocalKsdkDbPath,
+	getKsdkCacheFilePath,
+	saveKsdkDbCache,
+	type DetectSyncSourcesOptions,
+	type DetectedSyncSources,
+	type SyncSourceKind,
+};
 
 export interface KfxIndexEntry {
 	filePath: string;
@@ -73,23 +100,6 @@ interface ParsedNoteItem {
 	endPid: number;
 	createdTime: number;
 	noteText: string;
-}
-
-export function cleanBookTitleKey(title: string): string {
-	return title
-		.toLowerCase()
-		.replace(/[^\p{L}\p{N}]+/gu, "")
-		.trim();
-}
-
-export function normalizeHighlightDedupKey(text: string): string {
-	return text
-		.toLowerCase()
-		.replace(/[«»“”„"']/g, '"')
-		.replace(/[–—−‐\u00a0]/g, " ")
-		.replace(/[^\p{L}\p{N}\s]/gu, "")
-		.replace(/\s+/g, " ")
-		.trim();
 }
 
 function formatIsoDateForClipping(ms: number): string {
@@ -197,7 +207,7 @@ export async function loadCalibreAuthorMap(calibreLibraryPath: string): Promise<
 		const db = await CalibreDatabase.open(calibreLibraryPath);
 		try {
 			for (const book of db.getAllBooks()) {
-				const key = cleanBookTitleKey(book.title);
+				const key = normalizeAlnumKey(book.title);
 				if (key && book.authors && !map.has(key)) {
 					map.set(key, book.authors);
 				}
@@ -211,78 +221,55 @@ export async function loadCalibreAuthorMap(calibreLibraryPath: string): Promise<
 	return map;
 }
 
-export function getKsdkCacheFilePath(vaultBasePath?: string): string {
-	if (vaultBasePath) {
-		return path.join(
-			vaultBasePath,
-			".obsidian",
-			"plugins",
-			"kindle-calibre-sync",
-			KSDK_CACHE_FILENAME
+function findBestKsdkHighlightIdx(note: ParsedNoteItem, hlItems: ParsedHighlightItem[]): number {
+	let bestIdx = -1;
+	let bestScore = -Infinity;
+
+	for (let hi = 0; hi < hlItems.length; hi++) {
+		const h = hlItems[hi];
+		const strictlyInside = note.startPid >= h.startPid && note.endPid <= h.endPid;
+		const overlaps = note.endPid >= h.startPid && note.startPid <= h.endPid;
+		const nearFallback = note.endPid >= h.startPid - 30 && note.startPid <= h.endPid + 30;
+		if (!nearFallback) continue;
+
+		let score = strictlyInside ? 1000 : overlaps ? 600 : 150;
+		if (!overlaps) {
+			const dist =
+				note.endPid < h.startPid
+					? h.startPid - note.endPid
+					: note.startPid - h.endPid;
+			score -= dist;
+		}
+		score -= Math.min(2000, Math.max(0, h.endPid - h.startPid)) * 0.01;
+		if (note.createdTime > 0 && h.createdTime > 0) {
+			const diffSec = Math.abs(note.createdTime - h.createdTime) / 1000;
+			if (diffSec <= 5) score += 200;
+			else if (diffSec <= 60) score += 100;
+		}
+
+		if (score > bestScore) {
+			bestScore = score;
+			bestIdx = hi;
+		}
+	}
+
+	return bestIdx;
+}
+
+function shouldReplaceKsdkNoteEntry(
+	prev: { startPid: number; endPid: number; text: string },
+	cur: ParsedNoteItem
+): boolean {
+	if (prev.startPid === cur.startPid && prev.endPid === cur.endPid) {
+		return true;
+	}
+	if (Math.abs(prev.startPid - cur.startPid) <= 5) {
+		return (
+			normalizeEditCompareText(prev.text) === normalizeEditCompareText(cur.noteText) ||
+			isIncrementalTextEdit(prev.text, cur.noteText)
 		);
 	}
-	return path.join(os.homedir(), ".config", "kindle-calibre-sync", KSDK_CACHE_FILENAME);
-}
-
-/**
- * Persists a local snapshot of Kindle's ksdk_annotation_v1.db so future syncs can run offline without Kindle attached.
- */
-export async function saveKsdkDbCache(dbBytes: Uint8Array, vaultBasePath?: string): Promise<string | null> {
-	const target = getKsdkCacheFilePath(vaultBasePath);
-	try {
-		await fs.promises.mkdir(path.dirname(target), { recursive: true });
-		if (fs.existsSync(target)) {
-			const existing = await fs.promises.readFile(target);
-			if (existing.length === dbBytes.length && Buffer.compare(existing, dbBytes) === 0) {
-				return target;
-			}
-		}
-		await fs.promises.writeFile(target, dbBytes);
-		return target;
-	} catch {
-		return null;
-	}
-}
-
-export function findLocalKsdkDbPath(
-	configuredPath?: string,
-	vaultBasePath?: string,
-	clippingsPath?: string
-): string | null {
-	const candidates: string[] = [];
-	if (configuredPath?.trim()) {
-		const expanded = configuredPath.trim().startsWith("~/")
-			? path.join(os.homedir(), configuredPath.trim().slice(2))
-			: configuredPath.trim();
-		candidates.push(path.resolve(expanded));
-	}
-
-	const home = os.homedir();
-	if (clippingsPath) {
-		candidates.push(path.join(path.dirname(clippingsPath), "ksdk_annotation_v1.db"));
-	}
-	candidates.push(
-		path.join(home, "ksdk_annotation_v1.db"),
-		path.join(home, "Downloads", "ksdk_annotation_v1.db"),
-		path.join(home, "Documents", "ksdk_annotation_v1.db"),
-		path.join(home, "Desktop", "ksdk_annotation_v1.db")
-	);
-
-	if (vaultBasePath) {
-		candidates.push(getKsdkCacheFilePath(vaultBasePath));
-	}
-	candidates.push(getKsdkCacheFilePath(undefined));
-
-	for (const candidate of candidates) {
-		try {
-			if (candidate && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-				return candidate;
-			}
-		} catch {
-			/* ignore inaccessible candidates */
-		}
-	}
-	return null;
+	return false;
 }
 
 /**
@@ -314,7 +301,7 @@ export async function parseKsdkAnnotationsDb(
 		}
 
 		const res = db.exec(
-			"SELECT book_id, dataset, start_position, end_position, created_time, serialized_payload FROM nonsyncable_annotations WHERE dataset IN (1, 3) ORDER BY created_time ASC"
+			"SELECT book_id, dataset, start_position, end_position, created_time, serialized_payload FROM nonsyncable_annotations WHERE dataset IN (1, 3) ORDER BY created_time ASC, rowid ASC"
 		);
 		const rows = res[0]?.values ?? [];
 		stats.dbRowsTotal = rows.length;
@@ -332,7 +319,6 @@ export async function parseKsdkAnnotationsDb(
 		}
 
 		const pendingRows: PendingRow[] = [];
-		const neededAsins = new Set<string>();
 
 		for (const row of rows) {
 			const bookIdCol = String(row[0] ?? "");
@@ -372,7 +358,6 @@ export async function parseKsdkAnnotationsDb(
 			const rowCreated =
 				typeof payload.created_time === "number" ? payload.created_time : createdTime;
 
-			neededAsins.add(asin);
 			pendingRows.push({
 				asin,
 				dataset,
@@ -412,7 +397,7 @@ export async function parseKsdkAnnotationsDb(
 				const rawBytes = new Uint8Array(fs.readFileSync(idxEntry.filePath));
 				const parsed = parseKfxBook(rawBytes);
 				const title = parsed.metadata.title || idxEntry.meta.title || asin;
-				const calibreAuthor = ctx.calibreAuthorByTitle?.get(cleanBookTitleKey(title));
+				const calibreAuthor = ctx.calibreAuthorByTitle?.get(normalizeAlnumKey(title));
 				const author =
 					calibreAuthor ||
 					(parsed.metadata.authors.length > 0
@@ -480,7 +465,7 @@ export async function parseKsdkAnnotationsDb(
 			}
 		}
 
-		// Attach dataset=3 notes to overlapping highlights in the same book, or emit standalone note
+		// Attach dataset=3 notes to best-matching highlights in the same book, or emit deduplicated standalone note
 		for (const asin of new Set([...highlightsByAsin.keys(), ...notesByAsin.keys()])) {
 			const metaInfo = resolvedMetaCache.get(asin);
 			const parsed = parsedBookCache.get(asin);
@@ -488,20 +473,14 @@ export async function parseKsdkAnnotationsDb(
 
 			const hlItems = highlightsByAsin.get(asin) ?? [];
 			const noteItems = notesByAsin.get(asin) ?? [];
-			const resultClips: Clipping[] = hlItems.map((h) => h.clipping);
-
-			const attachedNotesByHl = new Map<number, Array<{ startPid: number; text: string }>>();
+			const attachedNotesByHl = new Map<
+				number,
+				Array<{ startPid: number; endPid: number; text: string }>
+			>();
+			const standaloneEntries: Array<{ item: ParsedNoteItem; clip: Clipping }> = [];
 
 			for (const n of noteItems) {
-				let matchedIdx = -1;
-				for (let hi = 0; hi < hlItems.length; hi++) {
-					const h = hlItems[hi];
-					const overlaps = n.endPid >= h.startPid - 30 && n.startPid <= h.endPid + 30;
-					if (overlaps) {
-						matchedIdx = hi;
-						break;
-					}
-				}
+				const matchedIdx = findBestKsdkHighlightIdx(n, hlItems);
 				if (matchedIdx >= 0) {
 					let noteList = attachedNotesByHl.get(matchedIdx);
 					if (!noteList) {
@@ -510,16 +489,16 @@ export async function parseKsdkAnnotationsDb(
 					}
 					let replacedIdx = -1;
 					for (let k = noteList.length - 1; k >= 0; k--) {
-						const prev = noteList[k];
-						if (Math.abs(prev.startPid - n.startPid) <= 5 || isIncrementalTextEdit(prev.text, n.noteText)) {
+						if (shouldReplaceKsdkNoteEntry(noteList[k], n)) {
 							replacedIdx = k;
 							break;
 						}
 					}
+					const entry = { startPid: n.startPid, endPid: n.endPid, text: n.noteText };
 					if (replacedIdx >= 0) {
-						noteList[replacedIdx] = { startPid: n.startPid, text: n.noteText };
+						noteList[replacedIdx] = entry;
 					} else {
-						noteList.push({ startPid: n.startPid, text: n.noteText });
+						noteList.push(entry);
 					}
 				} else {
 					const contextText = extractKfxTextRange(parsed.chunks, n.startPid, n.endPid);
@@ -529,7 +508,7 @@ export async function parseKsdkAnnotationsDb(
 						kfxPidToLocation(parsed.locationPids, n.endPid)
 					);
 					const clipText = contextText || n.noteText;
-					resultClips.push({
+					const clip: Clipping = {
 						title: metaInfo.title,
 						author: metaInfo.author,
 						entryType: "note",
@@ -540,20 +519,44 @@ export async function parseKsdkAnnotationsDb(
 						text: clipText,
 						refId: computeRefId(metaInfo.title, locationStart, clipText),
 						note: contextText ? n.noteText : undefined,
-					});
+					};
+
+					let replacedStandalone = false;
+					for (let k = standaloneEntries.length - 1; k >= 0; k--) {
+						const prev = standaloneEntries[k].item;
+						if (
+							shouldReplaceKsdkNoteEntry(
+								{ startPid: prev.startPid, endPid: prev.endPid, text: prev.noteText },
+								n
+							)
+						) {
+							standaloneEntries[k] = { item: n, clip };
+							replacedStandalone = true;
+							break;
+						}
+					}
+					if (!replacedStandalone) {
+						standaloneEntries.push({ item: n, clip });
+					}
 				}
 			}
 
 			for (const [hi, noteList] of attachedNotesByHl.entries()) {
-				const combined = noteList.map((item) => item.text).filter(Boolean).join("\n");
-				if (combined) {
-					hlItems[hi].clipping.note = hlItems[hi].clipping.note
-						? isIncrementalTextEdit(hlItems[hi].clipping.note, combined)
-							? combined
-							: `${hlItems[hi].clipping.note}\n${combined}`
-						: combined;
+				let combinedNote = hlItems[hi].clipping.note;
+				for (const entry of noteList) {
+					combinedNote = appendOrMergeNoteText(combinedNote, entry.text, {
+						replaceIncremental: false,
+					});
+				}
+				if (combinedNote) {
+					hlItems[hi].clipping.note = combinedNote;
 				}
 			}
+
+			const resultClips: Clipping[] = [
+				...hlItems.map((h) => h.clipping),
+				...standaloneEntries.map((s) => s.clip),
+			];
 
 			if (resultClips.length > 0) {
 				const existing = books.get(metaInfo.title);
@@ -572,439 +575,3 @@ export async function parseKsdkAnnotationsDb(
 		db.close();
 	}
 }
-
-/**
- * Merges legacy My Clippings.txt highlights with ksdk_annotation_v1.db highlights,
- * preserving legacy entries/refIds without duplication and appending any missing/new highlights & notes.
- */
-export function mergeClippingsAndKsdkBooks(
-	legacyBooks: Map<string, Clipping[]>,
-	ksdkBooks: Map<string, Clipping[]>
-): Map<string, Clipping[]> {
-	const merged = new Map<string, Clipping[]>();
-	const keyToCanonicalTitle = new Map<string, string>();
-
-	for (const [title, clips] of legacyBooks.entries()) {
-		merged.set(title, clips.map((c) => ({ ...c })));
-		const key = cleanBookTitleKey(title);
-		if (key && !keyToCanonicalTitle.has(key)) {
-			keyToCanonicalTitle.set(key, title);
-		}
-	}
-
-	for (const [dbTitle, dbClips] of ksdkBooks.entries()) {
-		const dbTitleKey = cleanBookTitleKey(dbTitle);
-		const targetTitle = merged.has(dbTitle)
-			? dbTitle
-			: keyToCanonicalTitle.get(dbTitleKey) || dbTitle;
-
-		const targetList = merged.get(targetTitle);
-		if (!targetList) {
-			merged.set(
-				targetTitle,
-				dbClips.map((c) => ({ ...c }))
-			);
-			if (dbTitleKey) {
-				keyToCanonicalTitle.set(dbTitleKey, targetTitle);
-			}
-			continue;
-		}
-
-		// Index existing highlights by normalized text for dedup
-		const existingByNorm = new Map<string, Clipping>();
-		for (const c of targetList) {
-			const norm = normalizeHighlightDedupKey(c.text);
-			if (norm) existingByNorm.set(norm, c);
-		}
-
-		for (const dbClip of dbClips) {
-			const norm = normalizeHighlightDedupKey(dbClip.text);
-			if (!norm) continue;
-
-			let duplicateOf = existingByNorm.get(norm);
-			if (!duplicateOf && norm.length >= 25) {
-				for (const [existingNorm, existingClip] of existingByNorm.entries()) {
-					if (
-						existingNorm.length >= 25 &&
-						(existingNorm.includes(norm) || norm.includes(existingNorm))
-					) {
-						duplicateOf = existingClip;
-						break;
-					}
-				}
-			}
-
-			if (duplicateOf) {
-				if (dbClip.note && !duplicateOf.note) {
-					duplicateOf.note = dbClip.note;
-				}
-				continue;
-			}
-
-			const clone: Clipping = {
-				...dbClip,
-				title: targetTitle,
-				author: dbClip.author || targetList[0]?.author || "",
-			};
-			targetList.push(clone);
-			existingByNorm.set(norm, clone);
-		}
-	}
-
-	return merged;
-}
-
-export type SyncSourceKind =
-	| "kindle-usb"
-	| "kindle-mtp"
-	| "configured-file"
-	| "local-fallback"
-	| "missing";
-
-export interface DetectedSyncSources {
-	clippingsSource: { path: string; content?: string } | null;
-	ksdkDb: { path: string; data: Uint8Array; fromCache: boolean } | null;
-	htmlSources: Array<{ path: string; content: string }>;
-	extraKfxDirs: string[];
-	sourceKind: SyncSourceKind;
-	deviceDetectedNotReady: boolean;
-	mtpWarning?: string;
-	fallbackClippingsSource: { path: string; content?: string } | null;
-	fallbackKsdkDb: { path: string; data: Uint8Array; fromCache: boolean } | null;
-	fallbackHtmlSources: Array<{ path: string; content: string }>;
-}
-
-export interface DetectSyncSourcesOptions {
-	clippingsPath?: string;
-	ksdkDbPath?: string;
-	kindleHtmlPath?: string;
-	vaultBasePath?: string;
-}
-
-function getUsbMountCandidates(): string[] {
-	const platform = os.platform();
-	const candidates: string[] = [];
-
-	if (platform === "linux") {
-		const user = os.userInfo().username || process.env.USER || "";
-		const parentDirs = [
-			"/Volumes",
-			"/mnt",
-			"/media",
-			"/run/media",
-			user ? `/media/${user}` : "",
-			user ? `/run/media/${user}` : "",
-		].filter(Boolean);
-
-		for (const parent of parentDirs) {
-			try {
-				if (!fs.existsSync(parent)) continue;
-				const stat = fs.statSync(parent);
-				if (!stat.isDirectory()) continue;
-				for (const sub of fs.readdirSync(parent, { withFileTypes: true })) {
-					if (sub.isDirectory()) {
-						candidates.push(path.join(parent, sub.name));
-					}
-				}
-			} catch {
-				/* ignore unreadable mount dir */
-			}
-		}
-	} else if (platform === "darwin") {
-		try {
-			for (const sub of fs.readdirSync("/Volumes", { withFileTypes: true })) {
-				if (sub.isDirectory()) {
-					candidates.push(path.join("/Volumes", sub.name));
-				}
-			}
-		} catch {
-			/* ignore */
-		}
-	} else if (platform === "win32") {
-		for (let code = 68; code <= 90; code++) {
-			const drive = `${String.fromCharCode(code)}:\\`;
-			try {
-				if (fs.existsSync(drive)) {
-					candidates.push(drive);
-				}
-			} catch {
-				/* ignore unavailable drive */
-			}
-		}
-	}
-
-	return candidates;
-}
-
-function findUsbKsdkDb(rootDir: string): string | null {
-	const annDir = path.join(rootDir, "system", "ksdk", ".annotations");
-	try {
-		if (!fs.existsSync(annDir)) return null;
-		let bestPath: string | null = null;
-		let bestSize = -1;
-		for (const sub of fs.readdirSync(annDir, { withFileTypes: true })) {
-			if (!sub.isDirectory()) continue;
-			const dbPath = path.join(annDir, sub.name, "ksdk_annotation_v1.db");
-			if (!fs.existsSync(dbPath)) continue;
-			const st = fs.statSync(dbPath);
-			if (st.isFile() && st.size > bestSize) {
-				bestSize = st.size;
-				bestPath = dbPath;
-			}
-		}
-		return bestPath;
-	} catch {
-		return null;
-	}
-}
-
-function findUsbClippingsPath(rootDir: string): string | null {
-	const candidates = [
-		path.join(rootDir, "documents", "My Clippings.txt"),
-		path.join(rootDir, "Documents", "My Clippings.txt"),
-		path.join(rootDir, "My Clippings.txt"),
-	];
-	for (const p of candidates) {
-		try {
-			if (fs.existsSync(p) && fs.statSync(p).isFile()) {
-				return p;
-			}
-		} catch {
-			/* ignore */
-		}
-	}
-	return null;
-}
-
-function resolveUserPath(rawPath?: string): string | null {
-	const trimmed = rawPath?.trim();
-	if (!trimmed) return null;
-	const expanded = trimmed.startsWith("~/") ? path.join(os.homedir(), trimmed.slice(2)) : trimmed;
-	return path.resolve(expanded);
-}
-
-function findLocalClippingsFile(
-	configuredPath?: string,
-	vaultBasePath?: string
-): { path: string; isConfigured: boolean } | null {
-	const configured = resolveUserPath(configuredPath);
-	if (configured) {
-		try {
-			if (fs.existsSync(configured) && fs.statSync(configured).isFile()) {
-				return { path: configured, isConfigured: true };
-			}
-		} catch {
-			/* fall through */
-		}
-	}
-
-	const home = os.homedir();
-	const fallbacks = [
-		path.join(home, "My Clippings.txt"),
-		path.join(home, "Documents", "My Clippings.txt"),
-		path.join(home, "Desktop", "My Clippings.txt"),
-		path.join(home, "Downloads", "My Clippings.txt"),
-		vaultBasePath ? path.join(vaultBasePath, "My Clippings.txt") : "",
-	].filter(Boolean);
-
-	for (const candidate of fallbacks) {
-		try {
-			if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-				return { path: candidate, isConfigured: false };
-			}
-		} catch {
-			/* ignore */
-		}
-	}
-
-	return null;
-}
-
-function readLocalKsdkFallback(
-	configuredKsdkPath?: string,
-	vaultBasePath?: string,
-	localClippingsPath?: string
-): { ksdkDb: { path: string; data: Uint8Array; fromCache: boolean } | null; isConfigured: boolean } {
-	const resolvedCfg = resolveUserPath(configuredKsdkPath);
-	const foundPath = findLocalKsdkDbPath(configuredKsdkPath, vaultBasePath, localClippingsPath);
-	if (!foundPath) return { ksdkDb: null, isConfigured: false };
-	try {
-		const data = new Uint8Array(fs.readFileSync(foundPath));
-		const isCache = path.basename(foundPath) === KSDK_CACHE_FILENAME;
-		const isConfigured = Boolean(resolvedCfg && path.resolve(foundPath) === resolvedCfg);
-		return {
-			ksdkDb: { path: foundPath, data, fromCache: isCache },
-			isConfigured,
-		};
-	} catch {
-		return { ksdkDb: null, isConfigured: false };
-	}
-}
-
-export function describeDetectedSyncSources(sources: DetectedSyncSources): string {
-	const parts: string[] = [];
-	if (sources.clippingsSource) {
-		parts.push("My Clippings.txt");
-	}
-	if (sources.ksdkDb) {
-		parts.push(
-			sources.ksdkDb.fromCache ? "cached ksdk_annotation_v1.db" : "ksdk_annotation_v1.db"
-		);
-	}
-	if (sources.htmlSources?.length > 0) {
-		parts.push(`${sources.htmlSources.length} HTML export(s)`);
-	}
-	const detail = parts.length > 0 ? ` (${parts.join(" + ")})` : "";
-	switch (sources.sourceKind) {
-		case "kindle-usb":
-			return `Kindle USB${detail}`;
-		case "kindle-mtp":
-			return `Kindle MTP${detail}`;
-		case "configured-file":
-			return `configured local file${detail}`;
-		case "local-fallback":
-			return `local fallback${detail}`;
-		default:
-			return "no sources found";
-	}
-}
-
-/**
- * Detects live Kindle sources (USB Mass Storage / MTP), Kindle Notebook HTML exports,
- * and local/cached fallbacks for both My Clippings.txt and Kindle's ksdk_annotation_v1.db.
- */
-export async function detectSyncSourcesAsync(
-	options: DetectSyncSourcesOptions
-): Promise<DetectedSyncSources> {
-	const { clippingsPath, ksdkDbPath, kindleHtmlPath, vaultBasePath } = options;
-	const htmlSources = detectKindleHtmlExports(kindleHtmlPath, vaultBasePath);
-
-	// 1. Live USB Mass Storage Kindle
-	for (const mountRoot of getUsbMountCandidates()) {
-		const isKindleMount =
-			/kindle/i.test(path.basename(mountRoot)) ||
-			fs.existsSync(path.join(mountRoot, "system", "ksdk")) ||
-			fs.existsSync(path.join(mountRoot, "documents", "My Clippings.txt"));
-		if (!isKindleMount) continue;
-
-		const usbClip = findUsbClippingsPath(mountRoot);
-		const usbDbPath = findUsbKsdkDb(mountRoot);
-		if (usbClip || usbDbPath) {
-			let ksdkDb: DetectedSyncSources["ksdkDb"] = null;
-			if (usbDbPath) {
-				const data = new Uint8Array(await fs.promises.readFile(usbDbPath));
-				await saveKsdkDbCache(data, vaultBasePath);
-				ksdkDb = { path: usbDbPath, data, fromCache: false };
-			}
-			const localClipFallback = !usbClip
-				? findLocalClippingsFile(clippingsPath, vaultBasePath)
-				: null;
-
-			const docsDir = path.join(mountRoot, "documents");
-			return {
-				clippingsSource: usbClip
-					? { path: usbClip }
-					: localClipFallback
-						? { path: localClipFallback.path }
-						: null,
-				ksdkDb,
-				htmlSources,
-				extraKfxDirs: fs.existsSync(docsDir) ? [docsDir] : [],
-				sourceKind: "kindle-usb",
-				deviceDetectedNotReady: false,
-				fallbackClippingsSource: null,
-				fallbackKsdkDb: null,
-				fallbackHtmlSources: [],
-			};
-		}
-	}
-
-	// 2. Live MTP Kindle (GVFS / GIO / Calibre MTP / libmtp)
-	const mtp = await readMtpKindleSources();
-	const localClip = findLocalClippingsFile(clippingsPath, vaultBasePath);
-	const localDb = readLocalKsdkFallback(ksdkDbPath, vaultBasePath, localClip?.path);
-
-	if (mtp.clippings || mtp.ksdkDb) {
-		let ksdkDb: DetectedSyncSources["ksdkDb"] = null;
-		if (mtp.ksdkDb) {
-			await saveKsdkDbCache(mtp.ksdkDb.data, vaultBasePath);
-			ksdkDb = {
-				path: mtp.ksdkDb.path,
-				data: mtp.ksdkDb.data,
-				fromCache: false,
-			};
-		}
-
-		const extraKfxDirs: string[] = [];
-		if (mtp.deviceRootDir) {
-			const mtpDocs = path.join(mtp.deviceRootDir, "documents");
-			if (fs.existsSync(mtpDocs)) {
-				extraKfxDirs.push(mtpDocs);
-			}
-		}
-
-		return {
-			clippingsSource: mtp.clippings
-				? { path: mtp.clippings.path, content: mtp.clippings.content }
-				: localClip
-					? { path: localClip.path }
-					: null,
-			ksdkDb: ksdkDb ?? localDb.ksdkDb,
-			htmlSources,
-			extraKfxDirs,
-			sourceKind: "kindle-mtp",
-			deviceDetectedNotReady: false,
-			fallbackClippingsSource: null,
-			fallbackKsdkDb: null,
-			fallbackHtmlSources: [],
-		};
-	}
-
-	if (mtp.warning) {
-		return {
-			clippingsSource: null,
-			ksdkDb: null,
-			htmlSources: [],
-			extraKfxDirs: [],
-			sourceKind: "missing",
-			deviceDetectedNotReady: true,
-			mtpWarning: mtp.warning,
-			fallbackClippingsSource: localClip ? { path: localClip.path } : null,
-			fallbackKsdkDb: localDb.ksdkDb,
-			fallbackHtmlSources: htmlSources,
-		};
-	}
-
-	// 3. Offline ("без киндла"): local My Clippings.txt + cached/local ksdk DB + Kindle HTML exports
-	if (localClip || localDb.ksdkDb || htmlSources.length > 0) {
-		const isConfigured = Boolean(
-			localClip?.isConfigured ||
-			localDb.isConfigured ||
-			(kindleHtmlPath?.trim() && htmlSources.length > 0)
-		);
-		return {
-			clippingsSource: localClip ? { path: localClip.path } : null,
-			ksdkDb: localDb.ksdkDb,
-			htmlSources,
-			extraKfxDirs: [],
-			sourceKind: isConfigured ? "configured-file" : "local-fallback",
-			deviceDetectedNotReady: false,
-			fallbackClippingsSource: null,
-			fallbackKsdkDb: null,
-			fallbackHtmlSources: [],
-		};
-	}
-
-	return {
-		clippingsSource: null,
-		ksdkDb: null,
-		htmlSources: [],
-		extraKfxDirs: [],
-		sourceKind: "missing",
-		deviceDetectedNotReady: false,
-		fallbackClippingsSource: null,
-		fallbackKsdkDb: null,
-		fallbackHtmlSources: [],
-	};
-}
-

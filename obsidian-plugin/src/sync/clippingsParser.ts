@@ -1,9 +1,17 @@
-import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import type { Clipping, ClippingType } from "../types";
 import { readMtpKindleClippings } from "./mtpClient";
+import {
+	appendOrMergeNoteText,
+	computeRefId,
+	isIncrementalTextEdit,
+	normalizeEditCompareText,
+	parseClippingTimestamp,
+} from "./textUtils";
+
+export { computeRefId, isIncrementalTextEdit };
 
 export interface DetectedClippings {
 	path: string;
@@ -75,108 +83,281 @@ export function parseMetadataLine(metaLine: string): {
 	return { entryType, page, locationStart, locationEnd, dateStr };
 }
 
-/**
- * Computes deterministic 5-digit ref ID matching obsidian-kindle-plugin / clippings_parser.py.
- */
-export function computeRefId(title: string, locationStart: number, text: string): string {
-	const digest = crypto.createHash("md5").update(`${title}:${locationStart}:${text}`, "utf8").digest("hex");
-	const refHash = parseInt(digest.slice(0, 6), 16);
-	return String((refHash % 90000) + 10000);
+const EDIT_BURST_MS = 10 * 60 * 1000;
+const REWRITE_BURST_MS = 2 * 60 * 1000;
+
+function areTimestampsWithin(aMs: number | null, bMs: number | null, maxDiffMs: number): boolean {
+	return aMs !== null && bMs !== null && Math.abs(bMs - aMs) <= maxDiffMs;
 }
 
-function normalizeEditCompareText(text: string): string {
-	return text.toLowerCase().replace(/\s+/g, " ").trim();
-}
+function shouldCollapseHighlightPair(
+	prev: Clipping,
+	cur: Clipping,
+	prevTs: number | null,
+	curTs: number | null
+): "keep-cur" | "keep-prev" | null {
+	if (prev.locationStart <= 0 || cur.locationStart <= 0) return null;
 
-/**
- * Returns true if two clipping/note texts look like incremental edits or duplicates of the same entry
- * (e.g. Kindle's progressive auto-save drafts in My Clippings.txt).
- */
-export function isIncrementalTextEdit(prevText: string, nextText: string): boolean {
-	const a = normalizeEditCompareText(prevText);
-	const b = normalizeEditCompareText(nextText);
-	if (!a || !b) return false;
-	if (a === b || b.startsWith(a) || a.startsWith(b)) return true;
+	const sameStart = prev.locationStart === cur.locationStart;
+	const sameEnd = prev.locationEnd === cur.locationEnd;
+	if (!sameStart && !sameEnd) return null;
 
-	const minLen = Math.min(a.length, b.length);
-	if (minLen >= 4) {
-		let common = 0;
-		while (common < minLen && a.charCodeAt(common) === b.charCodeAt(common)) {
-			common++;
-		}
-		if (common >= Math.ceil(minLen * 0.65)) {
-			return true;
-		}
+	const prevNorm = normalizeEditCompareText(prev.text);
+	const curNorm = normalizeEditCompareText(cur.text);
+	if (!prevNorm || !curNorm) return null;
+
+	if (curNorm === prevNorm && sameStart) {
+		return "keep-cur";
 	}
+
+	const expandedForward = sameStart && curNorm.startsWith(prevNorm);
+	const expandedBackward = sameEnd && curNorm.endsWith(prevNorm);
+	if (expandedForward || expandedBackward) {
+		return "keep-cur";
+	}
+
+	const closeBurst = areTimestampsWithin(prevTs, curTs, EDIT_BURST_MS);
+	const shrunkFromEnd = sameStart && prevNorm.startsWith(curNorm);
+	const shrunkFromStart = sameEnd && prevNorm.endsWith(curNorm);
+
+	if (shrunkFromEnd || shrunkFromStart) {
+		// When timestamps prove user edited the highlight in a short burst, keep the latest choice;
+		// otherwise only collapse same-start prefixes keeping the longer quote.
+		if (closeBurst) return "keep-cur";
+		if (shrunkFromEnd) return "keep-prev";
+	}
+
+	// Handle intermediate re-highlight wiggles over the exact same location bounds within 10 minutes
+	if (
+		closeBurst &&
+		sameStart &&
+		sameEnd &&
+		(prevNorm.includes(curNorm) || curNorm.includes(prevNorm))
+	) {
+		return "keep-cur";
+	}
+
+	return null;
+}
+
+function shouldCollapseNoteDrafts(
+	prevLoc: number,
+	prevPage: number | null,
+	prevText: string,
+	prevTs: number | null,
+	curLoc: number,
+	curPage: number | null,
+	curText: string,
+	curTs: number | null
+): boolean {
+	const normPrev = normalizeEditCompareText(prevText);
+	const normCur = normalizeEditCompareText(curText);
+	if (!normPrev || !normCur) return false;
+
+	if (prevLoc > 0 && curLoc > 0) {
+		if (prevLoc === curLoc) {
+			if (normPrev === normCur) return true;
+			if (isIncrementalTextEdit(prevText, curText)) return true;
+			return areTimestampsWithin(prevTs, curTs, REWRITE_BURST_MS);
+		}
+		if (Math.abs(prevLoc - curLoc) <= 2) {
+			const minLen = Math.min(normPrev.length, normCur.length);
+			return (
+				minLen >= 6 &&
+				isIncrementalTextEdit(prevText, curText) &&
+				(prevTs === null || curTs === null || areTimestampsWithin(prevTs, curTs, EDIT_BURST_MS))
+			);
+		}
+		return false;
+	}
+
+	// Page-only entries (locationStart === 0, e.g. PDFs): require matching page + incremental edit
+	if (prevPage !== null && curPage !== null && prevPage === curPage) {
+		return (
+			normPrev === normCur ||
+			(isIncrementalTextEdit(prevText, curText) &&
+				(prevTs === null || curTs === null || areTimestampsWithin(prevTs, curTs, EDIT_BURST_MS)))
+		);
+	}
+
 	return false;
 }
 
 /**
  * Collapses incremental highlight expansions and note edit logs within one book's clippings,
- * and attaches notes to matching highlights cleanly using the latest edit.
+ * and attaches notes to matching highlights using location, timestamp, and file proximity.
  */
 export function collapseAndAttachClippings(clist: Clipping[]): Clipping[] {
-	const rawHighlights = clist.filter((c) => c.entryType === "highlight");
-	const rawNotes = clist.filter((c) => c.entryType === "note");
-	const highlights: Clipping[] = [];
+	interface IndexedClipping {
+		clip: Clipping;
+		rawIndex: number;
+		ts: number | null;
+	}
 
-	for (const cur of rawHighlights) {
+	const rawHighlights: IndexedClipping[] = [];
+	const rawNotes: IndexedClipping[] = [];
+
+	for (let idx = 0; idx < clist.length; idx++) {
+		const c = clist[idx];
+		const item: IndexedClipping = {
+			clip: c,
+			rawIndex: idx,
+			ts: parseClippingTimestamp(c.dateStr),
+		};
+		if (c.entryType === "highlight") rawHighlights.push(item);
+		else if (c.entryType === "note") rawNotes.push(item);
+	}
+
+	const highlights: IndexedClipping[] = [];
+
+	for (const curItem of rawHighlights) {
 		let collapsed = false;
 		for (let i = highlights.length - 1; i >= 0; i--) {
-			const prev = highlights[i];
-			if (prev.locationStart > 0 && cur.locationStart > 0 && prev.locationStart === cur.locationStart) {
-				const prevNorm = normalizeEditCompareText(prev.text);
-				const curNorm = normalizeEditCompareText(cur.text);
-				if (curNorm === prevNorm || curNorm.startsWith(prevNorm)) {
-					highlights[i] = {
-						...cur,
-						note: cur.note || prev.note,
-					};
-					collapsed = true;
-					break;
-				}
-				if (prevNorm.startsWith(curNorm)) {
-					if (cur.note && !prev.note) {
-						highlights[i] = { ...prev, note: cur.note };
-					}
-					collapsed = true;
-					break;
-				}
+			const prevItem = highlights[i];
+			const decision = shouldCollapseHighlightPair(
+				prevItem.clip,
+				curItem.clip,
+				prevItem.ts,
+				curItem.ts
+			);
+			if (!decision) continue;
+
+			if (decision === "keep-cur") {
+				highlights[i] = {
+					clip: {
+						...curItem.clip,
+						note: appendOrMergeNoteText(prevItem.clip.note, curItem.clip.note, {
+							replaceIncremental: true,
+						}),
+					},
+					rawIndex: curItem.rawIndex,
+					ts: curItem.ts,
+				};
+			} else if (curItem.clip.note) {
+				highlights[i] = {
+					...prevItem,
+					clip: {
+						...prevItem.clip,
+						note: appendOrMergeNoteText(prevItem.clip.note, curItem.clip.note, {
+							replaceIncremental: true,
+						}),
+					},
+				};
 			}
+			collapsed = true;
+			break;
 		}
 		if (!collapsed) {
-			highlights.push({ ...cur });
+			highlights.push({
+				clip: { ...curItem.clip },
+				rawIndex: curItem.rawIndex,
+				ts: curItem.ts,
+			});
 		}
 	}
 
-	const attachedByIdx = new Map<number, Array<{ locationStart: number; text: string }>>();
-	const unmatchedNotes: Clipping[] = [];
+	interface AttachedNoteEntry {
+		locationStart: number;
+		page: number | null;
+		text: string;
+		ts: number | null;
+	}
 
-	const findBestHighlightIdx = (loc: number): number => {
+	const attachedByIdx = new Map<number, AttachedNoteEntry[]>();
+	const unmatchedNotes: IndexedClipping[] = [];
+
+	const findBestHighlightIdx = (noteItem: IndexedClipping): number => {
+		const n = noteItem.clip;
+		const loc = n.locationStart;
+
+		const scoreCandidate = (hItem: IndexedClipping, baseScore: number): number => {
+			let score = baseScore;
+			const h = hItem.clip;
+			if (noteItem.ts !== null && hItem.ts !== null) {
+				const diffSec = Math.abs(noteItem.ts - hItem.ts) / 1000;
+				if (diffSec <= 5) score += 600;
+				else if (diffSec <= 60) score += 350;
+				else if (diffSec <= 600) score += 150;
+			}
+			if (loc > 0 && h.locationEnd === loc) {
+				score += 15;
+			}
+			const span = h.locationStart > 0 ? Math.max(0, h.locationEnd - h.locationStart) : 0;
+			score -= Math.min(100, span) * 0.1;
+			score -= Math.min(50, Math.abs(hItem.rawIndex - noteItem.rawIndex)) * 0.2;
+			return score;
+		};
+
+		if (loc === 0) {
+			let bestIdx = -1;
+			let bestScore = -Infinity;
+			for (let i = 0; i < highlights.length; i++) {
+				const hItem = highlights[i];
+				const h = hItem.clip;
+				const pageMatch = n.page !== null && h.page !== null && n.page === h.page;
+				const unlocatedBurst =
+					n.page === null &&
+					h.page === null &&
+					h.locationStart === 0 &&
+					(areTimestampsWithin(noteItem.ts, hItem.ts, EDIT_BURST_MS) ||
+						Math.abs(hItem.rawIndex - noteItem.rawIndex) <= 3);
+				if (!pageMatch && !unlocatedBurst) continue;
+
+				const score = scoreCandidate(hItem, pageMatch ? 1000 : 200);
+				if (score > bestScore) {
+					bestScore = score;
+					bestIdx = i;
+				}
+			}
+			return bestIdx;
+		}
+
+		// Pass 1: strict containment
+		let bestStrictIdx = -1;
+		let bestStrictScore = -Infinity;
 		for (let i = 0; i < highlights.length; i++) {
-			const h = highlights[i];
-			if (h.locationStart <= loc && loc <= h.locationEnd) {
-				return i;
+			const hItem = highlights[i];
+			const h = hItem.clip;
+			if (h.locationStart > 0 && h.locationStart <= loc && loc <= h.locationEnd) {
+				const score = scoreCandidate(hItem, 1000);
+				if (score > bestStrictScore) {
+					bestStrictScore = score;
+					bestStrictIdx = i;
+				}
 			}
 		}
+		if (bestStrictIdx >= 0) return bestStrictIdx;
+
+		// Pass 2: +/- 5 location fallback
+		let bestNearIdx = -1;
+		let bestNearScore = -Infinity;
 		for (let i = 0; i < highlights.length; i++) {
-			const h = highlights[i];
-			if (
-				(h.locationStart <= loc && loc <= h.locationEnd + 5) ||
-				Math.abs(h.locationStart - loc) <= 5 ||
-				Math.abs(h.locationEnd - loc) <= 5
-			) {
-				return i;
+			const hItem = highlights[i];
+			const h = hItem.clip;
+			if (h.locationStart <= 0) continue;
+			const dist =
+				loc < h.locationStart
+					? h.locationStart - loc
+					: loc > h.locationEnd
+						? loc - h.locationEnd
+						: 0;
+			if (dist <= 5) {
+				const score = scoreCandidate(hItem, 200 - dist * 20);
+				if (score > bestNearScore) {
+					bestNearScore = score;
+					bestNearIdx = i;
+				}
 			}
 		}
-		return -1;
+		return bestNearIdx;
 	};
 
-	for (const n of rawNotes) {
+	for (const noteItem of rawNotes) {
+		const n = noteItem.clip;
 		const noteText = n.text.trim();
 		if (!noteText) continue;
 
-		const hi = findBestHighlightIdx(n.locationStart);
+		const hi = findBestHighlightIdx(noteItem);
 		if (hi >= 0) {
 			let list = attachedByIdx.get(hi);
 			if (!list) {
@@ -186,16 +367,32 @@ export function collapseAndAttachClippings(clist: Clipping[]): Clipping[] {
 			let updatedIdx = -1;
 			for (let k = list.length - 1; k >= 0; k--) {
 				const existing = list[k];
-				const sameLocation = n.locationStart > 0 && existing.locationStart === n.locationStart;
-				if (sameLocation || isIncrementalTextEdit(existing.text, noteText)) {
+				if (
+					shouldCollapseNoteDrafts(
+						existing.locationStart,
+						existing.page,
+						existing.text,
+						existing.ts,
+						n.locationStart,
+						n.page,
+						noteText,
+						noteItem.ts
+					)
+				) {
 					updatedIdx = k;
 					break;
 				}
 			}
+			const nextEntry: AttachedNoteEntry = {
+				locationStart: n.locationStart,
+				page: n.page,
+				text: noteText,
+				ts: noteItem.ts,
+			};
 			if (updatedIdx >= 0) {
-				list[updatedIdx] = { locationStart: n.locationStart, text: noteText };
+				list[updatedIdx] = nextEntry;
 			} else {
-				list.push({ locationStart: n.locationStart, text: noteText });
+				list.push(nextEntry);
 			}
 			continue;
 		}
@@ -203,33 +400,47 @@ export function collapseAndAttachClippings(clist: Clipping[]): Clipping[] {
 		let replacedUnmatched = false;
 		for (let k = unmatchedNotes.length - 1; k >= 0; k--) {
 			const existing = unmatchedNotes[k];
-			const sameLoc = n.locationStart > 0 && existing.locationStart === n.locationStart;
-			const closeEdit =
-				Math.abs(existing.locationStart - n.locationStart) <= 2 &&
-				isIncrementalTextEdit(existing.text, noteText);
-			if (sameLoc || closeEdit) {
-				unmatchedNotes[k] = { ...n, text: noteText };
+			if (
+				shouldCollapseNoteDrafts(
+					existing.clip.locationStart,
+					existing.clip.page,
+					existing.clip.text,
+					existing.ts,
+					n.locationStart,
+					n.page,
+					noteText,
+					noteItem.ts
+				)
+			) {
+				unmatchedNotes[k] = {
+					clip: { ...n, text: noteText },
+					rawIndex: noteItem.rawIndex,
+					ts: noteItem.ts,
+				};
 				replacedUnmatched = true;
 				break;
 			}
 		}
 		if (!replacedUnmatched) {
-			unmatchedNotes.push({ ...n, text: noteText });
+			unmatchedNotes.push({
+				clip: { ...n, text: noteText },
+				rawIndex: noteItem.rawIndex,
+				ts: noteItem.ts,
+			});
 		}
 	}
 
 	for (const [hi, list] of attachedByIdx.entries()) {
-		const combined = list.map((item) => item.text).filter(Boolean).join("\n");
-		if (combined) {
-			highlights[hi].note = highlights[hi].note
-				? isIncrementalTextEdit(highlights[hi].note, combined)
-					? combined
-					: `${highlights[hi].note}\n${combined}`
-				: combined;
+		let mergedNote = highlights[hi].clip.note;
+		for (const item of list) {
+			mergedNote = appendOrMergeNoteText(mergedNote, item.text, { replaceIncremental: false });
+		}
+		if (mergedNote) {
+			highlights[hi].clip.note = mergedNote;
 		}
 	}
 
-	return [...highlights, ...unmatchedNotes];
+	return [...highlights.map((h) => h.clip), ...unmatchedNotes.map((u) => u.clip)];
 }
 
 /**
