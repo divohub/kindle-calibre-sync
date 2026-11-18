@@ -3,6 +3,7 @@ export interface KindleCalibreSettings {
 	highlightsFolder: string;
 	clippingsPath: string;
 	ksdkDbPath?: string;
+	kindleHtmlPath?: string;
 	injectCalibreAnnotations: boolean;
 	autoOpenReader: boolean;
 	calibreLibraryId: string;

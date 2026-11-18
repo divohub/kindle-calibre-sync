@@ -25,6 +25,7 @@ import {
 	findBookDirectoryById,
 	findExistingEpubInDir,
 } from "./epubConverter";
+import { parseKindleHtmlSources } from "./kindleHtmlParser";
 import {
 	loadCalibreAuthorMap,
 	mergeClippingsAndKsdkBooks,
@@ -37,6 +38,7 @@ export interface SyncRunOptions {
 	settings: KindleCalibreSettings;
 	clippingsSource?: { path: string; content?: string } | null;
 	ksdkDb?: { path: string; data: Uint8Array } | null;
+	htmlSources?: Array<{ path: string; content?: string }>;
 	extraKfxDirs?: string[];
 	autoConvertToEpub?: boolean;
 	onProgress?: (message: string) => void;
@@ -89,7 +91,7 @@ export async function buildBooksIndexFromCalibre(settings: KindleCalibreSettings
 
 /**
  * Runs end-to-end native sync inside Obsidian without Python or external config:
- * parse My Clippings.txt + ksdk_annotation_v1.db -> match Calibre books ->
+ * parse My Clippings.txt + ksdk_annotation_v1.db + Kindle HTML exports -> match Calibre books ->
  * queue-convert missing EPUBs -> compute EPUB CFIs -> inject annotations into Calibre DB ->
  * export/update vault markdown notes -> refresh BooksIndex.
  */
@@ -99,6 +101,7 @@ export async function runNativeSync(options: SyncRunOptions): Promise<SyncRunRes
 		settings,
 		clippingsSource,
 		ksdkDb,
+		htmlSources = [],
 		extraKfxDirs = [],
 		autoConvertToEpub = true,
 		onProgress,
@@ -123,12 +126,18 @@ export async function runNativeSync(options: SyncRunOptions): Promise<SyncRunRes
 			kfxSearchDirs,
 			calibreAuthorByTitle,
 		});
-		booksClippings = mergeClippingsAndKsdkBooks(legacyBooks, ksdkResult.books);
+		booksClippings = mergeClippingsAndKsdkBooks(booksClippings, ksdkResult.books);
 		if (ksdkResult.stats.unresolvedAsins.length > 0) {
 			onProgress?.(
 				`Note: ${ksdkResult.stats.unresolvedAsins.length} KFX book(s) in Kindle DB had no local .kfx match in Calibre Library.`
 			);
 		}
+	}
+
+	if (htmlSources.length > 0) {
+		onProgress?.(`Parsing ${htmlSources.length} Kindle HTML export(s)...`);
+		const htmlBooks = parseKindleHtmlSources(htmlSources);
+		booksClippings = mergeClippingsAndKsdkBooks(booksClippings, htmlBooks);
 	}
 
 	let totalClips = 0;

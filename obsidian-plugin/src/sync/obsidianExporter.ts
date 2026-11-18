@@ -1,6 +1,7 @@
 import * as crypto from "crypto";
 import { App, normalizePath, TFile } from "obsidian";
 import type { Clipping } from "../types";
+import { isIncrementalTextEdit } from "./clippingsParser";
 
 export const DEFAULT_HIGHLIGHTS_FOLDER = "Kindle Highlights";
 
@@ -59,6 +60,25 @@ export function resolveHighlightsFolder(app: App, configuredFolder?: string): st
 	}
 
 	return bestFolder || DEFAULT_HIGHLIGHTS_FOLDER;
+}
+
+function looksLikeRepeatedEditHistory(oldNote: string, latestNote: string): boolean {
+	const lines = oldNote
+		.split(/\r?\n/)
+		.map((l) => l.trim())
+		.filter((l) => l.length > 0);
+	if (lines.length < 2) return false;
+	const latestNorm = latestNote.trim().toLowerCase().replace(/\s+/g, " ");
+	const lastNorm = lines[lines.length - 1].toLowerCase().replace(/\s+/g, " ");
+	let editPairs = 0;
+	for (let i = 0; i < lines.length - 1; i++) {
+		if (isIncrementalTextEdit(lines[i], lines[i + 1])) {
+			editPairs++;
+		}
+	}
+	if (editPairs > 0 && lastNorm === latestNorm) return true;
+	if (editPairs === lines.length - 1) return true;
+	return lines.every((l) => isIncrementalTextEdit(l, latestNote));
 }
 
 export class VaultExporter {
@@ -231,6 +251,16 @@ export class VaultExporter {
 			existingRefs.add(m[1]);
 		}
 
+		const clipByRefId = new Map<string, Clipping>();
+		const clipsByLoc = new Map<string, Clipping[]>();
+		for (const c of clippings) {
+			clipByRefId.set(c.refId, c);
+			const locKey = String(c.locationStart);
+			const locList = clipsByLoc.get(locKey);
+			if (locList) locList.push(c);
+			else clipsByLoc.set(locKey, [c]);
+		}
+
 		content = content.replace(
 			/(location:\s*)\[(\d+)\]\((.*?)\)\s*\^ref-(\w+)/g,
 			(fullMatch, prefix: string, loc: string, existingLink: string, refId: string) => {
@@ -248,6 +278,41 @@ export class VaultExporter {
 					updatedCount++;
 					return `${prefix}[${loc}](${targetLink}) ^ref-${refId}`;
 				}
+				return fullMatch;
+			}
+		);
+
+		content = content.replace(
+			/(\[(\d+)\]\([^)]*\)\s*\^ref-(\w+))[ \t]*((?:\r?\n[ \t]*)+\*Note\*:[ \t]*([\s\S]*?))?(?=(?:\r?\n[ \t]*)+---(?:\r?\n|$)|(?:\r?\n[ \t]*)+[^\n]*\^ref-\w+|\s*$)/g,
+			(fullMatch, anchorPart: string, loc: string, refId: string, _noteSection?: string, existingNote?: string) => {
+				let matchedClip = clipByRefId.get(refId);
+				if (!matchedClip) {
+					const locCandidates = clipsByLoc.get(loc);
+					if (locCandidates && locCandidates.length === 1) {
+						matchedClip = locCandidates[0];
+					}
+				}
+				const latestNote = matchedClip?.note?.trim();
+				if (!latestNote) {
+					return fullMatch;
+				}
+
+				if (existingNote === undefined) {
+					updatedCount++;
+					return `${anchorPart}\n\n*Note*: ${latestNote}`;
+				}
+
+				const prevNote = existingNote.trim();
+				const prevNorm = prevNote.toLowerCase().replace(/\s+/g, " ");
+				const latestNorm = latestNote.toLowerCase().replace(/\s+/g, " ");
+				if (
+					prevNorm !== latestNorm &&
+					(looksLikeRepeatedEditHistory(prevNote, latestNote) || latestNorm.startsWith(prevNorm))
+				) {
+					updatedCount++;
+					return `${anchorPart}\n\n*Note*: ${latestNote}`;
+				}
+
 				return fullMatch;
 			}
 		);

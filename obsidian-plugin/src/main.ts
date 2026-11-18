@@ -18,6 +18,7 @@ import {
 import * as fs from "fs";
 import * as path from "path";
 import { detectCalibreLibraryPath } from "./sync/calibreDb";
+import { isKindleHtmlExport } from "./sync/kindleHtmlParser";
 import {
 	describeDetectedSyncSources,
 	detectSyncSourcesAsync,
@@ -58,8 +59,81 @@ interface EditorWithMouse {
 interface SyncSourceBundle {
 	clippingsSource: { path: string; content?: string } | null;
 	ksdkDb: { path: string; data: Uint8Array } | null;
+	htmlSources?: Array<{ path: string; content?: string }>;
 	extraKfxDirs: string[];
 	label: string;
+}
+
+interface PickedFilesOutcome {
+	clippingsSource: { path: string; content: string } | null;
+	ksdkDb: { path: string; data: Uint8Array } | null;
+	htmlSources: Array<{ path: string; content: string }>;
+	rememberClippingsPath?: string;
+	rememberKsdkPath?: string;
+	rememberHtmlPath?: string;
+	ignoredHtmlCount: number;
+}
+
+async function readPickedSyncFiles(files: FileList, vaultBasePath?: string): Promise<PickedFilesOutcome> {
+	let clippingsSource: { path: string; content: string } | null = null;
+	let ksdkDb: { path: string; data: Uint8Array } | null = null;
+	const htmlSources: Array<{ path: string; content: string }> = [];
+	const htmlFsDirs = new Set<string>();
+	let singleHtmlFsPath = "";
+	let rememberClippingsPath: string | undefined;
+	let rememberKsdkPath: string | undefined;
+	let ignoredHtmlCount = 0;
+
+	for (const file of Array.from(files)) {
+		const lower = file.name.toLowerCase();
+		const maybePath = (file as { path?: unknown }).path;
+		const fsPath = typeof maybePath === "string" ? maybePath : "";
+		const pickedPath = fsPath || file.name;
+
+		if (lower.endsWith(".db")) {
+			const buf = await file.arrayBuffer();
+			const data = new Uint8Array(buf);
+			await saveKsdkDbCache(data, vaultBasePath);
+			ksdkDb = { path: pickedPath, data };
+			if (fsPath && fs.existsSync(fsPath)) {
+				rememberKsdkPath = fsPath;
+			}
+		} else if (lower.endsWith(".html") || lower.endsWith(".htm")) {
+			const content = await file.text();
+			if (isKindleHtmlExport(content)) {
+				htmlSources.push({ path: pickedPath, content });
+				if (fsPath && fs.existsSync(fsPath)) {
+					singleHtmlFsPath = fsPath;
+					htmlFsDirs.add(path.dirname(fsPath));
+				}
+			} else {
+				ignoredHtmlCount++;
+			}
+		} else {
+			const content = await file.text();
+			clippingsSource = { path: pickedPath, content };
+			if (fsPath && fs.existsSync(fsPath)) {
+				rememberClippingsPath = fsPath;
+			}
+		}
+	}
+
+	let rememberHtmlPath: string | undefined;
+	if (htmlSources.length > 1 && htmlFsDirs.size === 1) {
+		rememberHtmlPath = Array.from(htmlFsDirs)[0];
+	} else if (htmlSources.length === 1 && singleHtmlFsPath) {
+		rememberHtmlPath = singleHtmlFsPath;
+	}
+
+	return {
+		clippingsSource,
+		ksdkDb,
+		htmlSources,
+		rememberClippingsPath,
+		rememberKsdkPath,
+		rememberHtmlPath,
+		ignoredHtmlCount,
+	};
 }
 
 const DEFAULT_SETTINGS: KindleCalibreSettings = {
@@ -67,6 +141,7 @@ const DEFAULT_SETTINGS: KindleCalibreSettings = {
 	highlightsFolder: "",
 	clippingsPath: "",
 	ksdkDbPath: "",
+	kindleHtmlPath: "",
 	injectCalibreAnnotations: true,
 	autoOpenReader: true,
 	calibreLibraryId: "Calibre_Library",
@@ -82,11 +157,13 @@ class ClippingsPickerModal extends Modal {
 	private readonly onSelect: (
 		bundle: SyncSourceBundle,
 		rememberClippingsPath?: string,
-		rememberKsdkPath?: string
+		rememberKsdkPath?: string,
+		rememberHtmlPath?: string
 	) => void;
 	private readonly onRetryUsb: () => Promise<DetectedSyncSources>;
 	private readonly initialResult: DetectedSyncSources;
 	private readonly vaultBasePath?: string;
+	private readonly htmlOnly: boolean;
 
 	constructor(
 		app: App,
@@ -94,151 +171,163 @@ class ClippingsPickerModal extends Modal {
 		onSelect: (
 			bundle: SyncSourceBundle,
 			rememberClippingsPath?: string,
-			rememberKsdkPath?: string
+			rememberKsdkPath?: string,
+			rememberHtmlPath?: string
 		) => void,
 		initialResult: DetectedSyncSources,
-		vaultBasePath?: string
+		vaultBasePath?: string,
+		htmlOnly = false
 	) {
 		super(app);
 		this.onRetryUsb = onRetryUsb;
 		this.onSelect = onSelect;
 		this.initialResult = initialResult;
 		this.vaultBasePath = vaultBasePath;
+		this.htmlOnly = htmlOnly;
 	}
 
 	onOpen(): void {
 		const { contentEl } = this;
 		contentEl.empty();
 
-		contentEl.createEl("h3", { text: "Kindle device not detected" });
+		contentEl.createEl("h3", {
+			text: this.htmlOnly ? "Import Kindle Notebook export (.html)" : "Kindle device not detected",
+		});
 		const descEl = contentEl.createEl("p", {
 			cls: "kindle-modal-desc",
-			text:
-				this.initialResult.mtpWarning ||
-				"Connect your Kindle via USB (USB drive or MTP), unlock its screen, or choose a local My Clippings.txt or ksdk_annotation_v1.db file.",
+			text: this.htmlOnly
+				? "Select one or more .html files exported from Kindle for Mac / PC (Notebook -> Export)."
+				: this.initialResult.mtpWarning ||
+					"Connect your Kindle via USB/MTP, unlock its screen, or choose a local My Clippings.txt, ksdk_annotation_v1.db, or Kindle HTML export file.",
 		});
 
 		const fileInput = contentEl.createEl("input", {
 			cls: "kindle-hidden-file-input",
-			attr: { type: "file", accept: ".txt,.db,text/plain" },
+			attr: {
+				type: "file",
+				accept: this.htmlOnly ? ".html,.htm,text/html" : ".txt,.db,.html,.htm,text/plain,text/html",
+				multiple: "true",
+			},
 		});
 
 		fileInput.addEventListener("change", () => {
-			const file = fileInput.files?.[0];
-			if (!file) return;
+			const files = fileInput.files;
+			if (!files || files.length === 0) return;
 
-			const maybePath = (file as { path?: unknown }).path;
-			const fsPath = typeof maybePath === "string" ? maybePath : "";
-			const pickedPath = fsPath || file.name;
-			const isDb = file.name.toLowerCase().endsWith(".db");
+			void readPickedSyncFiles(files, this.vaultBasePath).then((picked) => {
+				if (picked.ignoredHtmlCount > 0 && !picked.clippingsSource && !picked.ksdkDb && picked.htmlSources.length === 0) {
+					new Notice("Selected HTML file is not a valid Kindle Notebook export.", 6000);
+					return;
+				}
+				if (!picked.clippingsSource && !picked.ksdkDb && picked.htmlSources.length === 0) {
+					return;
+				}
 
-			if (isDb) {
-				void file.arrayBuffer().then(async (buf) => {
-					const data = new Uint8Array(buf);
-					await saveKsdkDbCache(data, this.vaultBasePath);
-					const fallbackClip = this.initialResult.fallbackClippingsSource;
-					const labelParts = [
-						fallbackClip ? "legacy My Clippings.txt" : "",
-						"selected ksdk_annotation_v1.db",
-					].filter(Boolean);
-					this.close();
-					this.onSelect(
-						{
-							clippingsSource: fallbackClip,
-							ksdkDb: { path: pickedPath, data },
-							extraKfxDirs: [],
-							label: labelParts.join(" + "),
-						},
-						undefined,
-						fsPath && fs.existsSync(fsPath) ? fsPath : undefined
-					);
-				});
-				return;
-			}
+				const clip = picked.clippingsSource || (this.htmlOnly ? null : this.initialResult.fallbackClippingsSource);
+				const db = picked.ksdkDb || (this.htmlOnly ? null : this.initialResult.fallbackKsdkDb);
+				const htmls = picked.htmlSources.length > 0
+					? picked.htmlSources
+					: this.htmlOnly
+						? []
+						: this.initialResult.fallbackHtmlSources;
 
-			void file.text().then((content) => {
-				const fallbackDb = this.initialResult.fallbackKsdkDb;
-				const labelParts = [
-					"selected My Clippings.txt",
-					fallbackDb ? "cached ksdk_annotation_v1.db" : "",
-				].filter(Boolean);
+				const labelParts: string[] = [];
+				if (picked.clippingsSource) labelParts.push("selected My Clippings.txt");
+				else if (clip) labelParts.push("My Clippings.txt");
+				if (picked.ksdkDb) labelParts.push("selected ksdk_annotation_v1.db");
+				else if (db) labelParts.push("cached ksdk_annotation_v1.db");
+				if (htmls.length > 0) labelParts.push(`${htmls.length} HTML export(s)`);
+
 				this.close();
 				this.onSelect(
 					{
-						clippingsSource: { path: pickedPath, content },
-						ksdkDb: fallbackDb,
+						clippingsSource: clip,
+						ksdkDb: db,
+						htmlSources: htmls,
 						extraKfxDirs: [],
 						label: labelParts.join(" + "),
 					},
-					fsPath && fs.existsSync(fsPath) ? fsPath : undefined,
-					undefined
+					picked.rememberClippingsPath,
+					picked.rememberKsdkPath,
+					picked.rememberHtmlPath
 				);
 			});
 		});
 
 		const actions = contentEl.createDiv({ cls: "kindle-modal-actions" });
 
-		const retryBtn = actions.createEl("button", { text: "Retry Kindle detection" });
-		retryBtn.addEventListener("click", () => {
-			retryBtn.disabled = true;
-			retryBtn.textContent = "Checking...";
-			void this.onRetryUsb()
-				.then((result) => {
-					if (result.clippingsSource || result.ksdkDb) {
-						this.close();
-						this.onSelect({
-							clippingsSource: result.clippingsSource,
-							ksdkDb: result.ksdkDb,
-							extraKfxDirs: result.extraKfxDirs,
-							label: describeDetectedSyncSources(result),
-						});
-						return;
-					}
-					if (result.mtpWarning) {
-						descEl.textContent = result.mtpWarning;
-						new Notice(result.mtpWarning, 6000);
-					} else {
-						new Notice(
-							"Still no Kindle device found. Unlock Kindle screen, check USB cable, or pick a local .db / .txt file."
+		if (!this.htmlOnly) {
+			const retryBtn = actions.createEl("button", { text: "Retry Kindle detection" });
+			retryBtn.addEventListener("click", () => {
+				retryBtn.disabled = true;
+				retryBtn.textContent = "Checking...";
+				void this.onRetryUsb()
+					.then((result) => {
+						if (result.clippingsSource || result.ksdkDb || result.htmlSources.length > 0) {
+							this.close();
+							this.onSelect({
+								clippingsSource: result.clippingsSource,
+								ksdkDb: result.ksdkDb,
+								htmlSources: result.htmlSources,
+								extraKfxDirs: result.extraKfxDirs,
+								label: describeDetectedSyncSources(result),
+							});
+							return;
+						}
+						if (result.mtpWarning) {
+							descEl.textContent = result.mtpWarning;
+							new Notice(result.mtpWarning, 6000);
+						} else {
+							new Notice(
+								"Still no Kindle device found. Unlock Kindle screen, check USB cable, or pick local .txt / .db / .html files."
+							);
+						}
+					})
+					.catch((err) => {
+						new Notice(`Detection error: ${err instanceof Error ? err.message : String(err)}`);
+					})
+					.finally(() => {
+						retryBtn.disabled = false;
+						retryBtn.textContent = "Retry Kindle detection";
+					});
+			});
+
+			if (
+				this.initialResult.fallbackClippingsSource ||
+				this.initialResult.fallbackKsdkDb ||
+				this.initialResult.fallbackHtmlSources.length > 0
+			) {
+				const fallbackBtn = actions.createEl("button", {
+					text: "Use local/cached files",
+				});
+				fallbackBtn.addEventListener("click", () => {
+					const parts: string[] = [];
+					if (this.initialResult.fallbackClippingsSource) parts.push("My Clippings.txt");
+					if (this.initialResult.fallbackKsdkDb) {
+						parts.push(
+							this.initialResult.fallbackKsdkDb.fromCache
+								? "cached ksdk_annotation_v1.db"
+								: "ksdk_annotation_v1.db"
 						);
 					}
-				})
-				.catch((err) => {
-					new Notice(`Detection error: ${err instanceof Error ? err.message : String(err)}`);
-				})
-				.finally(() => {
-					retryBtn.disabled = false;
-					retryBtn.textContent = "Retry Kindle detection";
+					if (this.initialResult.fallbackHtmlSources.length > 0) {
+						parts.push(`${this.initialResult.fallbackHtmlSources.length} HTML export(s)`);
+					}
+					this.close();
+					this.onSelect({
+						clippingsSource: this.initialResult.fallbackClippingsSource,
+						ksdkDb: this.initialResult.fallbackKsdkDb,
+						htmlSources: this.initialResult.fallbackHtmlSources,
+						extraKfxDirs: [],
+						label: `local fallback (${parts.join(" + ")})`,
+					});
 				});
-		});
-
-		if (this.initialResult.fallbackClippingsSource || this.initialResult.fallbackKsdkDb) {
-			const fallbackBtn = actions.createEl("button", {
-				text: "Use local/cached files",
-			});
-			fallbackBtn.addEventListener("click", () => {
-				const parts: string[] = [];
-				if (this.initialResult.fallbackClippingsSource) parts.push("My Clippings.txt");
-				if (this.initialResult.fallbackKsdkDb) {
-					parts.push(
-						this.initialResult.fallbackKsdkDb.fromCache
-							? "cached ksdk_annotation_v1.db"
-							: "ksdk_annotation_v1.db"
-					);
-				}
-				this.close();
-				this.onSelect({
-					clippingsSource: this.initialResult.fallbackClippingsSource,
-					ksdkDb: this.initialResult.fallbackKsdkDb,
-					extraKfxDirs: [],
-					label: `local fallback (${parts.join(" + ")})`,
-				});
-			});
+			}
 		}
 
 		const pickBtn = actions.createEl("button", {
 			cls: "mod-cta",
-			text: "Choose .txt / .db file...",
+			text: this.htmlOnly ? "Choose .html file(s)..." : "Choose .txt / .db / .html...",
 		});
 		pickBtn.addEventListener("click", () => {
 			fileInput.click();
@@ -288,6 +377,14 @@ export default class KindleCalibrePlugin extends Plugin {
 			name: "Open book reader side-by-side",
 			callback: () => {
 				void this.openReaderLeaf();
+			},
+		});
+
+		this.addCommand({
+			id: "import-kindle-html",
+			name: "Import Kindle Desktop / App export (.html)",
+			callback: () => {
+				void this.runHtmlImport();
 			},
 		});
 
@@ -669,6 +766,66 @@ export default class KindleCalibrePlugin extends Plugin {
 		}
 	}
 
+	private openSourcePickerModal(
+		detection: DetectedSyncSources,
+		vaultBasePath: string | undefined,
+		htmlOnly: boolean
+	): void {
+		const modal = new ClippingsPickerModal(
+			this.app,
+			() =>
+				detectSyncSourcesAsync({
+					clippingsPath: this.settings.clippingsPath,
+					ksdkDbPath: this.settings.ksdkDbPath,
+					kindleHtmlPath: this.settings.kindleHtmlPath,
+					vaultBasePath,
+				}),
+			(bundle, rememberClipPath, rememberKsdkPath, rememberHtmlPath) => {
+				let changed = false;
+				if (rememberClipPath && !this.settings.clippingsPath) {
+					this.settings.clippingsPath = rememberClipPath;
+					changed = true;
+				}
+				if (rememberKsdkPath && !this.settings.ksdkDbPath) {
+					this.settings.ksdkDbPath = rememberKsdkPath;
+					changed = true;
+				}
+				if (rememberHtmlPath && !this.settings.kindleHtmlPath) {
+					this.settings.kindleHtmlPath = rememberHtmlPath;
+					changed = true;
+				}
+				if (changed) {
+					void this.saveSettings();
+				}
+				void this.executeSyncWithSource(bundle);
+			},
+			detection,
+			vaultBasePath,
+			htmlOnly
+		);
+		modal.open();
+	}
+
+	async runHtmlImport(): Promise<void> {
+		if (this.syncInProgress || this.detectingSource) {
+			new Notice("Kindle sync is already running.");
+			return;
+		}
+		const vaultBasePath = this.getVaultBasePath();
+		const emptyDetection: DetectedSyncSources = {
+			clippingsSource: null,
+			ksdkDb: null,
+			htmlSources: [],
+			extraKfxDirs: [],
+			sourceKind: "missing",
+			deviceDetectedNotReady: false,
+			fallbackClippingsSource: null,
+			fallbackKsdkDb: null,
+			fallbackHtmlSources: [],
+		};
+		this.openSourcePickerModal(emptyDetection, vaultBasePath, true);
+	}
+
 	async runSync(): Promise<void> {
 		if (this.syncInProgress || this.detectingSource) {
 			new Notice("Kindle sync is already running.");
@@ -683,6 +840,7 @@ export default class KindleCalibrePlugin extends Plugin {
 			detection = await detectSyncSourcesAsync({
 				clippingsPath: this.settings.clippingsPath,
 				ksdkDbPath: this.settings.ksdkDbPath,
+				kindleHtmlPath: this.settings.kindleHtmlPath,
 				vaultBasePath,
 			});
 		} finally {
@@ -690,43 +848,18 @@ export default class KindleCalibrePlugin extends Plugin {
 			this.detectingSource = false;
 		}
 
-		if (detection.clippingsSource || detection.ksdkDb) {
+		if (detection.clippingsSource || detection.ksdkDb || detection.htmlSources.length > 0) {
 			await this.executeSyncWithSource({
 				clippingsSource: detection.clippingsSource,
 				ksdkDb: detection.ksdkDb,
+				htmlSources: detection.htmlSources,
 				extraKfxDirs: detection.extraKfxDirs,
 				label: describeDetectedSyncSources(detection),
 			});
 			return;
 		}
 
-		const modal = new ClippingsPickerModal(
-			this.app,
-			() =>
-				detectSyncSourcesAsync({
-					clippingsPath: this.settings.clippingsPath,
-					ksdkDbPath: this.settings.ksdkDbPath,
-					vaultBasePath,
-				}),
-			(bundle, rememberClipPath, rememberKsdkPath) => {
-				let changed = false;
-				if (rememberClipPath && !this.settings.clippingsPath) {
-					this.settings.clippingsPath = rememberClipPath;
-					changed = true;
-				}
-				if (rememberKsdkPath && !this.settings.ksdkDbPath) {
-					this.settings.ksdkDbPath = rememberKsdkPath;
-					changed = true;
-				}
-				if (changed) {
-					void this.saveSettings();
-				}
-				void this.executeSyncWithSource(bundle);
-			},
-			detection,
-			vaultBasePath
-		);
-		modal.open();
+		this.openSourcePickerModal(detection, vaultBasePath, false);
 	}
 
 	private async executeSyncWithSource(bundle: SyncSourceBundle): Promise<void> {
@@ -743,6 +876,7 @@ export default class KindleCalibrePlugin extends Plugin {
 				settings: this.settings,
 				clippingsSource: bundle.clippingsSource,
 				ksdkDb: bundle.ksdkDb,
+				htmlSources: bundle.htmlSources,
 				extraKfxDirs: bundle.extraKfxDirs,
 				autoConvertToEpub: true,
 				onProgress: (msg) => {
@@ -835,6 +969,15 @@ class KindleCalibreSettingTab extends PluginSettingTab {
 				},
 			},
 			{
+				name: "Kindle Notebook HTML path or folder",
+				desc: "Optional .html file or folder of Notebook -> Export files from Kindle for Mac/PC",
+				control: {
+					type: "text",
+					key: "kindleHtmlPath",
+					defaultValue: DEFAULT_SETTINGS.kindleHtmlPath,
+				},
+			},
+			{
 				name: "Inject highlights into Calibre",
 				desc: "Write matched Kindle highlights and notes directly into Calibre metadata.db",
 				control: {
@@ -924,6 +1067,19 @@ class KindleCalibreSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName("Kindle Notebook HTML path or folder")
+			.setDesc("Optional .html file or folder of Notebook -> Export files from Kindle for Mac/PC")
+			.addText((text) =>
+				text
+					.setPlaceholder("Auto: <vault>/Kindle Exports or ~/Documents/Kindle Exports")
+					.setValue(this.plugin.settings.kindleHtmlPath || "")
+					.onChange(async (val) => {
+						this.plugin.settings.kindleHtmlPath = val.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
 			.setName("Inject highlights into Calibre")
 			.setDesc("Also save highlights and notes directly into Calibre metadata.db")
 			.addToggle((toggle) =>
@@ -949,7 +1105,14 @@ class KindleCalibreSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Sync highlights")
-			.setDesc("Run a full Kindle -> Calibre -> vault sync now")
+			.setDesc("Run a full Kindle -> Calibre -> vault sync or import Kindle Desktop .html exports")
+			.addButton((btn) =>
+				btn
+					.setButtonText("Import .html...")
+					.onClick(() => {
+						void this.plugin.runHtmlImport();
+					})
+			)
 			.addButton((btn) =>
 				btn
 					.setButtonText("Sync now")

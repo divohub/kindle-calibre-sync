@@ -2,19 +2,19 @@
 
 Desktop Obsidian plugin for syncing Kindle highlights and personal notes into your Obsidian vault and Calibre library, with an embedded side-by-side EPUB reader.
 
-Supports both legacy Kindle USB drives (`My Clippings.txt`) and modern MTP Kindle firmware (`ksdk_annotation_v1.db` + `.kfx`), works without Python, and can also run offline from local files and a cached Kindle database snapshot.
+Supports legacy Kindle USB drives (`My Clippings.txt`), modern MTP Kindle firmware (`ksdk_annotation_v1.db` + `.kfx`), Kindle Desktop / Mobile Notebook HTML exports (`.html` via `Notebook -> Export`), and offline syncing via local files and cached snapshots — without Python.
 
 ![Kindle Calibre Sync Demo](assets/demo.png)
 
 ## How It Works
 
-Connect your Kindle (or keep a cached/local export ready) and trigger sync from the left ribbon (**Sync Kindle highlights with Calibre**) or Command Palette:
+Connect your Kindle (or save `.html` exports from Kindle for Mac / PC) and trigger sync from the left ribbon (**Sync Kindle highlights with Calibre**) or Command Palette:
 
-1. **Detect Kindle sources**: Checks connected USB Mass Storage Kindles, MTP Kindles, configured local paths, and cached snapshots, or prompts you to select `My Clippings.txt` manually.
-2. **Parse & merge highlights**: Extracts highlights and attached notes from `My Clippings.txt`, `ksdk_annotation_v1.db` (resolving KFX locations directly in TypeScript), or both combined without duplicating existing entries.
+1. **Detect Kindle sources**: Checks connected USB Mass Storage Kindles, MTP Kindles, Kindle Notebook `.html` export folders, configured local paths, and cached snapshots, or prompts you to select `.txt`, `.db`, or `.html` files manually.
+2. **Parse, clean & merge highlights**: Extracts highlights and attached notes from `My Clippings.txt`, `ksdk_annotation_v1.db` (resolving KFX locations in TypeScript), and Kindle `.html` exports. Progressive typing/edit logs recorded by Kindle on the same location are collapsed to the latest edit and merged without duplicates.
 3. **Prepare EPUBs in Calibre**: Matches books in Calibre's `metadata.db`. Matched books without an `.epub` copy are queued and converted automatically via `ebook-convert`, then registered in `metadata.db`.
 4. **Index CFIs & inject annotations**: Calculates exact EPUB CFI coordinates in memory (`sql.js-fts5` + `jszip`) and optionally writes annotations back into Calibre's `metadata.db`.
-5. **Update vault notes**: Resolves your highlights folder (by existing `kindle-title` / `kindle-bookId` frontmatter or `Kindle Highlights/`), creates `Author-Title.md` notes, and appends only unseen highlights with deep links (`[location](calibre://view-book/.../EPUB?open_at=epubcfi(...))`).
+5. **Update vault notes**: Resolves your highlights folder (by existing `kindle-title` / `kindle-bookId` frontmatter or `Kindle Highlights/`), creates `Author-Title.md` notes, repairs previously stacked edit-log notes, and appends unseen highlights with deep links (`[location](calibre://view-book/.../EPUB?open_at=epubcfi(...))`).
 6. **Read side-by-side**: Clicking any location link opens the book directly in a split `ePub.js` pane scrolled to the exact quote.
 
 ## Supported Kindle Sources
@@ -23,8 +23,9 @@ Connect your Kindle (or keep a cached/local export ready) and trigger sync from 
 | --- | --- | --- |
 | Legacy USB Mass Storage | `documents/My Clippings.txt` | Linux (`/run/media`, `/media`, `/mnt`), macOS (`/Volumes`), Windows (`D:`–`Z:`) |
 | Modern MTP Firmware (including Scribe / recent Kindles) | `system/ksdk/.annotations/*/ksdk_annotation_v1.db` + `.kfx` | Linux GVFS (`gvfs-mtp`) / `gio`, Calibre MTP driver (`calibre-debug`), or `libmtp` |
-| Mixed / Transitioning Devices | `My Clippings.txt` + `ksdk_annotation_v1.db` | Automatically merged and deduplicated with personal notes preserved |
-| Offline / Kindle Disconnected | Local `My Clippings.txt` + `ksdk_annotation_v1.cache.db` | Configured paths, `~/`, `~/Documents`, `~/Downloads`, `~/Desktop`, vault root, and plugin cache |
+| Kindle Desktop / Mobile App (macOS, Windows, iOS/Android) | Notebook `.html` files (`Notebook -> Export`) | Multi-file import command (**Import Kindle Desktop / App export (.html)**) or auto-scanned export folder (`Kindle Exports/`) |
+| Mixed / Transitioning Devices | `My Clippings.txt` + `ksdk_annotation_v1.db` + `.html` | Automatically merged and deduplicated with personal notes preserved |
+| Offline / Kindle Disconnected | Local `My Clippings.txt`, `.html` + `ksdk_annotation_v1.cache.db` | Configured paths, `~/`, `~/Documents`, `~/Downloads`, `~/Desktop`, vault root, and plugin cache |
 
 Each live USB/MTP sync saves a local snapshot of `ksdk_annotation_v1.db` as `.obsidian/plugins/kindle-calibre-sync/ksdk_annotation_v1.cache.db` so later syncs continue working when the Kindle is unplugged.
 
@@ -57,6 +58,7 @@ All fields are optional; leave them blank to use automatic detection:
 - **Highlights folder**: Vault folder for book notes (auto-detects existing folders with `kindle-title` or `kindle-bookId` frontmatter, otherwise defaults to `Kindle Highlights`).
 - **Legacy clippings file path**: Explicit `My Clippings.txt` path used when no Kindle is attached.
 - **Kindle annotation DB path (`ksdk_annotation_v1.db`)**: Explicit path to an offline `ksdk_annotation_v1.db` or cached DB copy.
+- **Kindle Notebook HTML path or folder**: Optional `.html` file or folder containing `Notebook -> Export` files saved from Kindle for Mac / PC (also auto-scans `<vault>/Kindle Exports` and `~/Documents/Kindle Exports`).
 - **Inject highlights into Calibre**: Toggle writing highlights and personal notes into Calibre's `metadata.db`.
 - **Open reader side-by-side**: Toggle opening `calibre://view-book/...` links inside Obsidian's embedded reader instead of forwarding to the OS handler.
 

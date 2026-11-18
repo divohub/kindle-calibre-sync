@@ -84,9 +84,157 @@ export function computeRefId(title: string, locationStart: number, text: string)
 	return String((refHash % 90000) + 10000);
 }
 
+function normalizeEditCompareText(text: string): string {
+	return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Returns true if two clipping/note texts look like incremental edits or duplicates of the same entry
+ * (e.g. Kindle's progressive auto-save drafts in My Clippings.txt).
+ */
+export function isIncrementalTextEdit(prevText: string, nextText: string): boolean {
+	const a = normalizeEditCompareText(prevText);
+	const b = normalizeEditCompareText(nextText);
+	if (!a || !b) return false;
+	if (a === b || b.startsWith(a) || a.startsWith(b)) return true;
+
+	const minLen = Math.min(a.length, b.length);
+	if (minLen >= 4) {
+		let common = 0;
+		while (common < minLen && a.charCodeAt(common) === b.charCodeAt(common)) {
+			common++;
+		}
+		if (common >= Math.ceil(minLen * 0.65)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Collapses incremental highlight expansions and note edit logs within one book's clippings,
+ * and attaches notes to matching highlights cleanly using the latest edit.
+ */
+export function collapseAndAttachClippings(clist: Clipping[]): Clipping[] {
+	const rawHighlights = clist.filter((c) => c.entryType === "highlight");
+	const rawNotes = clist.filter((c) => c.entryType === "note");
+	const highlights: Clipping[] = [];
+
+	for (const cur of rawHighlights) {
+		let collapsed = false;
+		for (let i = highlights.length - 1; i >= 0; i--) {
+			const prev = highlights[i];
+			if (prev.locationStart > 0 && cur.locationStart > 0 && prev.locationStart === cur.locationStart) {
+				const prevNorm = normalizeEditCompareText(prev.text);
+				const curNorm = normalizeEditCompareText(cur.text);
+				if (curNorm === prevNorm || curNorm.startsWith(prevNorm)) {
+					highlights[i] = {
+						...cur,
+						note: cur.note || prev.note,
+					};
+					collapsed = true;
+					break;
+				}
+				if (prevNorm.startsWith(curNorm)) {
+					if (cur.note && !prev.note) {
+						highlights[i] = { ...prev, note: cur.note };
+					}
+					collapsed = true;
+					break;
+				}
+			}
+		}
+		if (!collapsed) {
+			highlights.push({ ...cur });
+		}
+	}
+
+	const attachedByIdx = new Map<number, Array<{ locationStart: number; text: string }>>();
+	const unmatchedNotes: Clipping[] = [];
+
+	const findBestHighlightIdx = (loc: number): number => {
+		for (let i = 0; i < highlights.length; i++) {
+			const h = highlights[i];
+			if (h.locationStart <= loc && loc <= h.locationEnd) {
+				return i;
+			}
+		}
+		for (let i = 0; i < highlights.length; i++) {
+			const h = highlights[i];
+			if (
+				(h.locationStart <= loc && loc <= h.locationEnd + 5) ||
+				Math.abs(h.locationStart - loc) <= 5 ||
+				Math.abs(h.locationEnd - loc) <= 5
+			) {
+				return i;
+			}
+		}
+		return -1;
+	};
+
+	for (const n of rawNotes) {
+		const noteText = n.text.trim();
+		if (!noteText) continue;
+
+		const hi = findBestHighlightIdx(n.locationStart);
+		if (hi >= 0) {
+			let list = attachedByIdx.get(hi);
+			if (!list) {
+				list = [];
+				attachedByIdx.set(hi, list);
+			}
+			let updatedIdx = -1;
+			for (let k = list.length - 1; k >= 0; k--) {
+				const existing = list[k];
+				const sameLocation = n.locationStart > 0 && existing.locationStart === n.locationStart;
+				if (sameLocation || isIncrementalTextEdit(existing.text, noteText)) {
+					updatedIdx = k;
+					break;
+				}
+			}
+			if (updatedIdx >= 0) {
+				list[updatedIdx] = { locationStart: n.locationStart, text: noteText };
+			} else {
+				list.push({ locationStart: n.locationStart, text: noteText });
+			}
+			continue;
+		}
+
+		let replacedUnmatched = false;
+		for (let k = unmatchedNotes.length - 1; k >= 0; k--) {
+			const existing = unmatchedNotes[k];
+			const sameLoc = n.locationStart > 0 && existing.locationStart === n.locationStart;
+			const closeEdit =
+				Math.abs(existing.locationStart - n.locationStart) <= 2 &&
+				isIncrementalTextEdit(existing.text, noteText);
+			if (sameLoc || closeEdit) {
+				unmatchedNotes[k] = { ...n, text: noteText };
+				replacedUnmatched = true;
+				break;
+			}
+		}
+		if (!replacedUnmatched) {
+			unmatchedNotes.push({ ...n, text: noteText });
+		}
+	}
+
+	for (const [hi, list] of attachedByIdx.entries()) {
+		const combined = list.map((item) => item.text).filter(Boolean).join("\n");
+		if (combined) {
+			highlights[hi].note = highlights[hi].note
+				? isIncrementalTextEdit(highlights[hi].note, combined)
+					? combined
+					: `${highlights[hi].note}\n${combined}`
+				: combined;
+		}
+	}
+
+	return [...highlights, ...unmatchedNotes];
+}
+
 /**
  * Parses My Clippings.txt text content into a map of book title -> clippings list.
- * Links notes to nearby highlights within a ±5 location window.
+ * Collapses Kindle's progressive note edit logs and links notes to nearby highlights.
  */
 export function parseClippingsContent(content: string): Map<string, Clipping[]> {
 	const cleanContent = content.replace(/^\ufeff/, "");
@@ -134,29 +282,7 @@ export function parseClippingsContent(content: string): Map<string, Clipping[]> 
 
 	const result = new Map<string, Clipping[]>();
 	for (const [title, clist] of books.entries()) {
-		const highlights = clist.filter((c) => c.entryType === "highlight");
-		const notes = clist.filter((c) => c.entryType === "note");
-		const unmatchedNotes: Clipping[] = [];
-
-		for (const n of notes) {
-			let matched = false;
-			for (const h of highlights) {
-				if (
-					(h.locationStart <= n.locationStart && n.locationStart <= h.locationEnd + 5) ||
-					Math.abs(h.locationStart - n.locationStart) <= 5 ||
-					Math.abs(h.locationEnd - n.locationStart) <= 5
-				) {
-					h.note = h.note ? `${h.note}\n${n.text}` : n.text;
-					matched = true;
-					break;
-				}
-			}
-			if (!matched) {
-				unmatchedNotes.push(n);
-			}
-		}
-
-		result.set(title, [...highlights, ...unmatchedNotes]);
+		result.set(title, collapseAndAttachClippings(clist));
 	}
 
 	return result;

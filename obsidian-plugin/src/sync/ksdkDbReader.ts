@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Clipping } from "../types";
 import { CalibreDatabase, getSqlJs } from "./calibreDb";
-import { computeRefId } from "./clippingsParser";
+import { computeRefId, isIncrementalTextEdit } from "./clippingsParser";
 import {
 	extractKfxTextRange,
 	kfxPidToLocation,
@@ -12,6 +12,7 @@ import {
 	type KfxMetadata,
 	type KfxParsedBook,
 } from "./kfxReader";
+import { detectKindleHtmlExports } from "./kindleHtmlParser";
 import { readMtpKindleSources } from "./mtpClient";
 
 const KSDK_CACHE_FILENAME = "ksdk_annotation_v1.cache.db";
@@ -489,19 +490,37 @@ export async function parseKsdkAnnotationsDb(
 			const noteItems = notesByAsin.get(asin) ?? [];
 			const resultClips: Clipping[] = hlItems.map((h) => h.clipping);
 
+			const attachedNotesByHl = new Map<number, Array<{ startPid: number; text: string }>>();
+
 			for (const n of noteItems) {
-				let matched: ParsedHighlightItem | null = null;
-				for (const h of hlItems) {
+				let matchedIdx = -1;
+				for (let hi = 0; hi < hlItems.length; hi++) {
+					const h = hlItems[hi];
 					const overlaps = n.endPid >= h.startPid - 30 && n.startPid <= h.endPid + 30;
 					if (overlaps) {
-						matched = h;
+						matchedIdx = hi;
 						break;
 					}
 				}
-				if (matched) {
-					matched.clipping.note = matched.clipping.note
-						? `${matched.clipping.note}\n${n.noteText}`
-						: n.noteText;
+				if (matchedIdx >= 0) {
+					let noteList = attachedNotesByHl.get(matchedIdx);
+					if (!noteList) {
+						noteList = [];
+						attachedNotesByHl.set(matchedIdx, noteList);
+					}
+					let replacedIdx = -1;
+					for (let k = noteList.length - 1; k >= 0; k--) {
+						const prev = noteList[k];
+						if (Math.abs(prev.startPid - n.startPid) <= 5 || isIncrementalTextEdit(prev.text, n.noteText)) {
+							replacedIdx = k;
+							break;
+						}
+					}
+					if (replacedIdx >= 0) {
+						noteList[replacedIdx] = { startPid: n.startPid, text: n.noteText };
+					} else {
+						noteList.push({ startPid: n.startPid, text: n.noteText });
+					}
 				} else {
 					const contextText = extractKfxTextRange(parsed.chunks, n.startPid, n.endPid);
 					const locationStart = kfxPidToLocation(parsed.locationPids, n.startPid);
@@ -522,6 +541,17 @@ export async function parseKsdkAnnotationsDb(
 						refId: computeRefId(metaInfo.title, locationStart, clipText),
 						note: contextText ? n.noteText : undefined,
 					});
+				}
+			}
+
+			for (const [hi, noteList] of attachedNotesByHl.entries()) {
+				const combined = noteList.map((item) => item.text).filter(Boolean).join("\n");
+				if (combined) {
+					hlItems[hi].clipping.note = hlItems[hi].clipping.note
+						? isIncrementalTextEdit(hlItems[hi].clipping.note, combined)
+							? combined
+							: `${hlItems[hi].clipping.note}\n${combined}`
+						: combined;
 				}
 			}
 
@@ -634,17 +664,20 @@ export type SyncSourceKind =
 export interface DetectedSyncSources {
 	clippingsSource: { path: string; content?: string } | null;
 	ksdkDb: { path: string; data: Uint8Array; fromCache: boolean } | null;
+	htmlSources: Array<{ path: string; content: string }>;
 	extraKfxDirs: string[];
 	sourceKind: SyncSourceKind;
 	deviceDetectedNotReady: boolean;
 	mtpWarning?: string;
 	fallbackClippingsSource: { path: string; content?: string } | null;
 	fallbackKsdkDb: { path: string; data: Uint8Array; fromCache: boolean } | null;
+	fallbackHtmlSources: Array<{ path: string; content: string }>;
 }
 
 export interface DetectSyncSourcesOptions {
 	clippingsPath?: string;
 	ksdkDbPath?: string;
+	kindleHtmlPath?: string;
 	vaultBasePath?: string;
 }
 
@@ -818,6 +851,9 @@ export function describeDetectedSyncSources(sources: DetectedSyncSources): strin
 			sources.ksdkDb.fromCache ? "cached ksdk_annotation_v1.db" : "ksdk_annotation_v1.db"
 		);
 	}
+	if (sources.htmlSources?.length > 0) {
+		parts.push(`${sources.htmlSources.length} HTML export(s)`);
+	}
 	const detail = parts.length > 0 ? ` (${parts.join(" + ")})` : "";
 	switch (sources.sourceKind) {
 		case "kindle-usb":
@@ -834,13 +870,14 @@ export function describeDetectedSyncSources(sources: DetectedSyncSources): strin
 }
 
 /**
- * Detects live Kindle sources (USB Mass Storage / MTP) and local/cached fallbacks
- * for both legacy My Clippings.txt and Kindle's ksdk_annotation_v1.db.
+ * Detects live Kindle sources (USB Mass Storage / MTP), Kindle Notebook HTML exports,
+ * and local/cached fallbacks for both My Clippings.txt and Kindle's ksdk_annotation_v1.db.
  */
 export async function detectSyncSourcesAsync(
 	options: DetectSyncSourcesOptions
 ): Promise<DetectedSyncSources> {
-	const { clippingsPath, ksdkDbPath, vaultBasePath } = options;
+	const { clippingsPath, ksdkDbPath, kindleHtmlPath, vaultBasePath } = options;
+	const htmlSources = detectKindleHtmlExports(kindleHtmlPath, vaultBasePath);
 
 	// 1. Live USB Mass Storage Kindle
 	for (const mountRoot of getUsbMountCandidates()) {
@@ -871,11 +908,13 @@ export async function detectSyncSourcesAsync(
 						? { path: localClipFallback.path }
 						: null,
 				ksdkDb,
+				htmlSources,
 				extraKfxDirs: fs.existsSync(docsDir) ? [docsDir] : [],
 				sourceKind: "kindle-usb",
 				deviceDetectedNotReady: false,
 				fallbackClippingsSource: null,
 				fallbackKsdkDb: null,
+				fallbackHtmlSources: [],
 			};
 		}
 	}
@@ -911,11 +950,13 @@ export async function detectSyncSourcesAsync(
 					? { path: localClip.path }
 					: null,
 			ksdkDb: ksdkDb ?? localDb.ksdkDb,
+			htmlSources,
 			extraKfxDirs,
 			sourceKind: "kindle-mtp",
 			deviceDetectedNotReady: false,
 			fallbackClippingsSource: null,
 			fallbackKsdkDb: null,
+			fallbackHtmlSources: [],
 		};
 	}
 
@@ -923,37 +964,47 @@ export async function detectSyncSourcesAsync(
 		return {
 			clippingsSource: null,
 			ksdkDb: null,
+			htmlSources: [],
 			extraKfxDirs: [],
 			sourceKind: "missing",
 			deviceDetectedNotReady: true,
 			mtpWarning: mtp.warning,
 			fallbackClippingsSource: localClip ? { path: localClip.path } : null,
 			fallbackKsdkDb: localDb.ksdkDb,
+			fallbackHtmlSources: htmlSources,
 		};
 	}
 
-	// 3. Offline ("без киндла"): local My Clippings.txt + configured/local/cached ksdk_annotation_v1.db
-	if (localClip || localDb.ksdkDb) {
-		const isConfigured = Boolean(localClip?.isConfigured || localDb.isConfigured);
+	// 3. Offline ("без киндла"): local My Clippings.txt + cached/local ksdk DB + Kindle HTML exports
+	if (localClip || localDb.ksdkDb || htmlSources.length > 0) {
+		const isConfigured = Boolean(
+			localClip?.isConfigured ||
+			localDb.isConfigured ||
+			(kindleHtmlPath?.trim() && htmlSources.length > 0)
+		);
 		return {
 			clippingsSource: localClip ? { path: localClip.path } : null,
 			ksdkDb: localDb.ksdkDb,
+			htmlSources,
 			extraKfxDirs: [],
 			sourceKind: isConfigured ? "configured-file" : "local-fallback",
 			deviceDetectedNotReady: false,
 			fallbackClippingsSource: null,
 			fallbackKsdkDb: null,
+			fallbackHtmlSources: [],
 		};
 	}
 
 	return {
 		clippingsSource: null,
 		ksdkDb: null,
+		htmlSources: [],
 		extraKfxDirs: [],
 		sourceKind: "missing",
 		deviceDetectedNotReady: false,
 		fallbackClippingsSource: null,
 		fallbackKsdkDb: null,
+		fallbackHtmlSources: [],
 	};
 }
 
